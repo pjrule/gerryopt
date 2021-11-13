@@ -2,7 +2,7 @@
 import ast
 import inspect
 from textwrap import dedent
-from typing import Callable, Iterable, Set, Dict
+from typing import Callable, Iterable, Set, Dict, List
 from gerrychain import Graph
 from gerrychain.updaters import Tally
 
@@ -26,7 +26,11 @@ class CompileError(Exception):
 
 
 class DSLValidationVisitor(ast.NodeVisitor):
-    """AST visitor for verifying that a function matches the GerryOpt DSL."""
+    """AST visitor for verifying that a function matches the GerryOpt DSL.
+    
+    For now, this consists of checking for explicitly disallowed statement
+    or expression forms.
+    """
     def generic_visit(self, node):
         if type(node) in DSL_DISALLOWED_STATEMENTS:
             raise CompileError('Encountered statement outside of GerryOpt DSL '
@@ -59,6 +63,77 @@ class AssignmentNormalizer(ast.NodeTransformer):
         return ast.Assign(targets=[node.target],
                           value=node.value,
                           type_comment=None)
+
+
+class LoadedNamesVisitor(ast.NodeVisitor):
+    """AST visitor for finding loaded names."""
+    def __init__(self, *args, **kwargs):
+        self.loaded = set()
+        super().__init__(*args, **kwargs)
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load):
+            self.loaded.add(node.id)
+
+
+def find_bound_locals(fn_ast: ast.FunctionDef,
+                      ctx: inspect.ClosureVars) -> Set[str]:
+    """Determines the names of bound locals in a compilable function."""
+    if ctx.unbound:
+        raise CompileError(f'Function has unbound names {ctx.unbound}.')
+    # TODO: filter closure variables to minimum necessary set.
+    closure_vars = set.union(*(set(v.keys())
+                               for v in (ctx.globals, ctx.nonlocals,
+                                         ctx.builtins)))
+    bound_locals, _ = new_bindings(fn_ast.body, set(), closure_vars)
+    return bound_locals
+
+
+def new_bindings(statements: List[ast.AST], bound_locals: Set[str],
+                 loaded_names: Set[str], closure_vars: Set[str]):
+    bound_locals = bound_locals.copy()
+    loaded_names = loaded_names.copy()
+    for statement in statements:
+        if isinstance(statement, ast.If):
+            if_bindings, if_loaded = new_bindings(statement.body, bound_locals,
+                                                  closure_vars)
+            else_bindings, else_loaded = new_bindings(statement.orelse,
+                                                      bound_locals,
+                                                      closure_vars)
+            bound_locals |= (if_bindings & else_bindings)
+            loaded_names |= (if_loaded | else_loaded)
+        elif isinstance(statement.Assign):
+            statement_visitor = LoadedNamesVisitor()
+            statement_visitor.visit(statement.value)
+            loaded_names |= statement_visitor.loaded
+
+            # We say that a local is unbound if either:
+            #   (a) Its name is neither in the closure variables nor was previously
+            #       on the l.h.s. of any assignment statement.
+            #   (b) Its name is in the closure context but is on the l.h.s. of some
+            #       assignment statement *after* its value is loaded.
+            targets = set(t.id for t in statement.targets)
+            unbound_b = targets & loaded_names & closure_vars
+            if unbound_b:
+                raise CompileError(
+                    f'Unbound locals: cannot assign names {unbound_b} '
+                    'that were previously loaded as globals or nonlocals.')
+            unbound_a = statement_visitor.loaded - bound_locals - closure_vars
+            if unbound_a:
+                raise CompileError(
+                    f'Unbound locals: cannot load names {unbound_a}.')
+        elif isinstance(statement, ast.Return):
+            statement_visitor = LoadedNamesVisitor()
+            statement_visitor.visit(statement.body)
+            loaded_names |= statement_visitor.loaded
+            unbound = statement_visitor.loaded - bound_locals - closure_vars
+            if unbound:
+                raise CompileError(
+                    f'Unbound locals: cannot load names {unbound}.')
+        else:
+            raise CompileError(
+                f'Encountered invalid statement (type {type(statement)}).')
+    return bound_locals, loaded_names
 
 
 def type_graph_column(graph: Graph, column: str):

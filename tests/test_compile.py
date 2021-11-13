@@ -5,8 +5,9 @@ import networkx as nx
 from copy import copy
 from textwrap import dedent
 from typing import Callable
-from gerryopt.compile import (type_graph_column, tally_columns, CompileError,
-                              to_ast, load_function_ast, type_updater_columns,
+from gerryopt.compile import (LoadedNamesVisitor, type_graph_column,
+                              tally_columns, CompileError, to_ast,
+                              load_function_ast, type_updater_columns,
                               DSLValidationVisitor, AssignmentNormalizer)
 from gerrychain.updaters import Tally, cut_edges
 from gerrychain.grid import create_grid_graph
@@ -209,3 +210,16 @@ def test_assignment_normalizer_annotated_assignment():
     expected_ast = fn_to_ast(test_fn_normalized)
     actual_ast = AssignmentNormalizer().visit(fn_to_ast(test_fn))
     assert ast_equal(expected_ast, actual_ast)
+
+
+def test_loaded_names_visitor():
+    def test_fn(x, y, z, q, r):
+        if x == 2:
+            return y
+        elif z == 3:
+            return 2 + x
+        return q
+
+    visitor = LoadedNamesVisitor()
+    visitor.visit(fn_to_ast(test_fn))
+    assert visitor.loaded == {'x', 'y', 'z', 'q'}
