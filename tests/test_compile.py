@@ -4,11 +4,13 @@ import pytest
 import networkx as nx
 from copy import copy
 from textwrap import dedent
+from inspect import getclosurevars as get_ctx
 from typing import Callable
 from gerryopt.compile import (LoadedNamesVisitor, type_graph_column,
                               tally_columns, CompileError, to_ast,
                               load_function_ast, type_updater_columns,
-                              DSLValidationVisitor, AssignmentNormalizer)
+                              DSLValidationVisitor, AssignmentNormalizer,
+                              find_names)
 from gerrychain.updaters import Tally, cut_edges
 from gerrychain.grid import create_grid_graph
 
@@ -223,3 +225,124 @@ def test_loaded_names_visitor():
     visitor = LoadedNamesVisitor()
     visitor.visit(fn_to_ast(test_fn))
     assert visitor.loaded == {'x', 'y', 'z', 'q'}
+
+
+def test_find_names_simple_assignments():
+    def test_fn(x):
+        y = 1
+        z = 2
+        return x + y + z
+
+    locals, _ = find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    assert locals == {'x', 'y', 'z'}
+
+
+def test_find_names_simple_unbound():
+    def test_fn():
+        return x
+
+    with pytest.raises(CompileError):
+        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+
+
+def test_find_names_elif_good():
+    def test_fn(x):
+        if x == 1:
+            y = 1
+        elif x == 2:
+            y = 2
+        elif x == 3:
+            y = 3
+        else:
+            y = 4
+        return y + 1
+
+    locals, _ = find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    assert locals == {'x', 'y'}
+
+
+def test_find_names_if_bad():
+    def test_fn(x):
+        if x == 1:
+            y = 1
+        # y is only defined in one branch of the if statement,
+        # so this may not necessarily work. In our DSL, we do
+        # not allow such a scenario.
+        return y + 1
+
+    with pytest.raises(CompileError):
+        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+
+
+def test_find_names_globals_nonlocals_good():
+    y = 1
+
+    def test_fn(x):
+        z = x + y  # uses nonlocal
+        return always_accept  # uses global
+
+    locals, closure_vars = find_names(
+        fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    assert locals == {'x', 'z'}
+    assert closure_vars == {'y', 'always_accept'}
+
+
+def test_find_names_globals_nonlocals_assignment_shadowing():
+    y = 1
+
+    def test_fn(x):
+        y = 2
+        z = x + y  # uses local that shadows nonlocal
+        return always_accept  # uses global
+
+    locals, closure_vars = find_names(
+        fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    assert locals == {'x', 'y', 'z'}
+    assert closure_vars == {'always_accept'}
+
+
+def test_find_names_globals_nonlocals_arg_shadowing():
+    y = 1
+
+    def test_fn(x, always_accept):
+        z = x + y  # uses nonlocal
+        return always_accept  # uses local that shadows global
+
+    locals, closure_vars = find_names(
+        fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    assert locals == {'x', 'z', 'always_accept'}
+    assert closure_vars == {'y'}
+
+
+def test_find_names_nonlocals_bad_ref_before_set():
+    y = 1
+
+    def test_fn():
+        # This raises an UnboundLocalError, which we can
+        # pick up with static analysis in this case.
+        if y == 1:
+            y += 2
+
+    with pytest.raises(CompileError):
+        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+
+
+def test_find_names_unbound_in_if_test():
+    def test_fn():
+        if x == 1:
+            return 1
+        return 2
+
+    with pytest.raises(CompileError):
+        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+
+
+def test_find_names_unsupported_statement():
+    def test_fn():
+        x = 0
+        for i in range(10):
+            x += i
+        return x
+
+    with pytest.raises(CompileError):
+        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))

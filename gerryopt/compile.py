@@ -2,7 +2,7 @@
 import ast
 import inspect
 from textwrap import dedent
-from typing import Callable, Iterable, Set, Dict, List
+from typing import Callable, Iterable, Set, Dict, List, Union
 from gerrychain import Graph
 from gerrychain.updaters import Tally
 
@@ -18,6 +18,7 @@ DSL_DISALLOWED_EXPRESSIONS = {
     ast.GeneratorExp, ast.Await, ast.Yield, ast.YieldFrom, ast.FormattedValue,
     ast.JoinedStr, ast.Starred, ast.List, ast.Tuple
 }
+Primitive = Union[int, float, bool]
 Updaters = Dict[str, Callable]
 
 
@@ -76,33 +77,59 @@ class LoadedNamesVisitor(ast.NodeVisitor):
             self.loaded.add(node.id)
 
 
-def find_bound_locals(fn_ast: ast.FunctionDef,
-                      ctx: inspect.ClosureVars) -> Set[str]:
-    """Determines the names of bound locals in a compilable function."""
+class ClosureValuesTransformer(ast.NodeTransformer):
+    """AST transformer that replaces references to captured values with
+    their literal values, performing basic type checks along the way.
+    """
+    def __init__(self, *args, vals: Dict[str, Primitive], **kwargs):
+        self.vals = vals
+        super().__init__(*args, **kwargs)
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and node.id in self.vals:
+            return ast.Constant(value=self.vals[node.id], kind=None)
+        return node
+
+
+def find_names(fn_ast: ast.FunctionDef, ctx: inspect.ClosureVars) -> Set[str]:
+    """Determines the names of bound locals and closure variables in a compilable function."""
     if ctx.unbound:
         raise CompileError(f'Function has unbound names {ctx.unbound}.')
     # TODO: filter closure variables to minimum necessary set.
     closure_vars = set.union(*(set(v.keys())
                                for v in (ctx.globals, ctx.nonlocals,
                                          ctx.builtins)))
-    bound_locals, _ = new_bindings(fn_ast.body, set(), closure_vars)
-    return bound_locals
+    params = set(a.arg for a in fn_ast.args.args)
+    closure_vars -= params
+    bound_locals, _ = new_bindings(fn_ast.body, params, set(), closure_vars)
+    return bound_locals, closure_vars
 
 
 def new_bindings(statements: List[ast.AST], bound_locals: Set[str],
                  loaded_names: Set[str], closure_vars: Set[str]):
     bound_locals = bound_locals.copy()
     loaded_names = loaded_names.copy()
+
+    def load_expr(expr):
+        expr_visitor = LoadedNamesVisitor()
+        expr_visitor.visit(expr)
+        unbound = expr_visitor.loaded - bound_locals - closure_vars
+        if unbound:
+            raise CompileError(f'Unbound locals: cannot load names {unbound}.')
+        return expr_visitor.loaded
+
     for statement in statements:
         if isinstance(statement, ast.If):
+            loaded_names |= load_expr(statement.test)
             if_bindings, if_loaded = new_bindings(statement.body, bound_locals,
-                                                  closure_vars)
+                                                  loaded_names, closure_vars)
             else_bindings, else_loaded = new_bindings(statement.orelse,
                                                       bound_locals,
+                                                      loaded_names,
                                                       closure_vars)
             bound_locals |= (if_bindings & else_bindings)
             loaded_names |= (if_loaded | else_loaded)
-        elif isinstance(statement.Assign):
+        elif isinstance(statement, ast.Assign):
             statement_visitor = LoadedNamesVisitor()
             statement_visitor.visit(statement.value)
             loaded_names |= statement_visitor.loaded
@@ -122,14 +149,9 @@ def new_bindings(statements: List[ast.AST], bound_locals: Set[str],
             if unbound_a:
                 raise CompileError(
                     f'Unbound locals: cannot load names {unbound_a}.')
+            bound_locals |= targets
         elif isinstance(statement, ast.Return):
-            statement_visitor = LoadedNamesVisitor()
-            statement_visitor.visit(statement.body)
-            loaded_names |= statement_visitor.loaded
-            unbound = statement_visitor.loaded - bound_locals - closure_vars
-            if unbound:
-                raise CompileError(
-                    f'Unbound locals: cannot load names {unbound}.')
+            loaded_names |= load_expr(statement.value)
         else:
             raise CompileError(
                 f'Encountered invalid statement (type {type(statement)}).')
@@ -202,6 +224,9 @@ def to_ast(fn: Callable, fn_type: str, graph: Graph, updaters: Updaters):
     raw_fn_ast = load_function_ast(fn)
     DSLValidationVisitor().visit(raw_fn_ast)
     fn_ast = AssignmentNormalizer().visit(raw_fn_ast)
+    # bound_locals, closure_vars = find_names(fn_ast, fn_context)
+    # fn_ast = ClosureValuesTransformer(closure_vars).visit(fn_ast)
+
     for stmt in fn_ast.body:
         if isinstance(stmt, ast.Assign):
             pass
