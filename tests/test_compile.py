@@ -6,11 +6,11 @@ from copy import copy
 from textwrap import dedent
 from inspect import getclosurevars as get_ctx
 from typing import Callable
-from gerryopt.compile import (LoadedNamesVisitor, type_graph_column,
-                              tally_columns, CompileError, to_ast,
-                              load_function_ast, type_updater_columns,
-                              DSLValidationVisitor, AssignmentNormalizer,
-                              find_names)
+from gerryopt.compile import (LoadedNamesVisitor, preprocess_ast,
+                              type_graph_column, tally_columns, CompileError,
+                              to_ast, load_function_ast, type_updater_columns,
+                              preprocess_ast, DSLValidationVisitor,
+                              AssignmentNormalizer, find_names)
 from gerrychain.updaters import Tally, cut_edges
 from gerrychain.grid import create_grid_graph
 
@@ -43,14 +43,23 @@ def ast_equal(a: ast.AST, b: ast.AST):
     # For now, we use the hack of comparing AST dumps, but this may
     # cause false negatives in some cases.
     # (see https://stackoverflow.com/q/3312989)
-    assert len(a.body) == len(b.body) == 1
-    assert isinstance(a.body[0], ast.FunctionDef)
-    assert isinstance(b.body[0], ast.FunctionDef)
-    a = copy(a)
-    b = copy(b)
-    a.body[0].name = ''
-    b.body[0].name = ''
-    return ast.dump(a.body[0]) == ast.dump(b.body[0])
+    if isinstance(a, ast.Module):
+        assert len(a.body) == len(b.body) == 1
+        assert isinstance(a.body[0], ast.FunctionDef)
+        assert isinstance(b.body[0], ast.FunctionDef)
+        a = copy(a)
+        b = copy(b)
+        a.body[0].name = ''
+        b.body[0].name = ''
+        return ast.dump(a.body[0]) == ast.dump(b.body[0])
+    elif isinstance(a, ast.FunctionDef):
+        a = copy(a)
+        b = copy(b)
+        a.name = ''
+        b.name = ''
+        return ast.dump(a) == ast.dump(b)
+    else:
+        raise ValueError('Cannot compare ASTs.')
 
 
 def test_type_graph_column_int(grid_with_attrs):
@@ -214,6 +223,14 @@ def test_assignment_normalizer_annotated_assignment():
     assert ast_equal(expected_ast, actual_ast)
 
 
+def test_assignment_normalizer_multiple_target_assignment():
+    def test_fn(x, y):
+        x, y = y, x
+
+    with pytest.raises(CompileError):
+        AssignmentNormalizer().visit(fn_to_ast(test_fn))
+
+
 def test_loaded_names_visitor():
     def test_fn(x, y, z, q, r):
         if x == 2:
@@ -346,3 +363,33 @@ def test_find_names_unsupported_statement():
 
     with pytest.raises(CompileError):
         find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+
+
+def test_preprocess_ast_nonlocal_substitution_primitives():
+    x = 1
+    y = 2.0
+    z = True
+
+    def test_fn(a):
+        if z:
+            return x + y
+        return a
+
+    def test_fn_normalized(a):
+        if True:
+            return 1 + 2.0
+        return a
+
+    expected_ast = fn_to_ast(test_fn_normalized).body[0]
+    actual_ast = preprocess_ast(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    assert ast_equal(expected_ast, actual_ast)
+
+
+def test_preprocess_ast_nonlocal_substitution_non_primitive():
+    x = 'a'
+
+    def test_fn():
+        return x
+
+    with pytest.raises(CompileError):
+        preprocess_ast(fn_to_ast(test_fn).body[0], get_ctx(test_fn))

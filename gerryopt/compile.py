@@ -1,8 +1,10 @@
 """Compiler/transpiler for the GerryOpt DSL."""
 import ast
 import inspect
+from copy import deepcopy
 from textwrap import dedent
-from typing import Callable, Iterable, Set, Dict, List, Union
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, Set, Dict, List, Union, Any, Optional, Tuple
 from gerrychain import Graph
 from gerrychain.updaters import Tally
 
@@ -50,8 +52,16 @@ class AssignmentNormalizer(ast.NodeTransformer):
     assignments. However, for the purposes of the GerryOpt DSL, we treat them
     as syntactic sugar. Type annotations are not relevant to the GerryOpt DSL,
     as the type system is quite simple, so we simply strip them without validating
-    them.
+    them. Multiple-target assignment (e.g. `x, y = y, x`) is not allowed.
     """
+    def visit_Assign(self, node: ast.Assign) -> ast.Assign:
+        if len(node.targets) > 1:
+            # TODO
+            raise CompileError(
+                'Multiple-target assignment not supported by the GerryChain DSL.'
+            )
+        return node
+
     def visit_AugAssign(self, node: ast.AugAssign) -> ast.Assign:
         return ast.Assign(targets=[node.target],
                           value=ast.BinOp(left=ast.Name(id=node.target.id,
@@ -87,8 +97,17 @@ class ClosureValuesTransformer(ast.NodeTransformer):
 
     def visit_Name(self, node):
         if isinstance(node.ctx, ast.Load) and node.id in self.vals:
-            return ast.Constant(value=self.vals[node.id], kind=None)
+            if type(self.vals[node.id]) in PRIMITIVE_TYPES:
+                return ast.Constant(value=self.vals[node.id], kind=None)
+            raise CompileError(
+                f'Cannot substitute non-primitive value (name "{node.id}" '
+                f'has type {type(self.vals[node.id])}).')
         return node
+
+
+def merge_closure_vars(ctx: inspect.ClosureVars) -> Dict[str, Any]:
+    """Merges nonlocals, globals, and builtins in `ctx`."""
+    return {**ctx.globals, **ctx.nonlocals, **ctx.builtins}
 
 
 def find_names(fn_ast: ast.FunctionDef, ctx: inspect.ClosureVars) -> Set[str]:
@@ -96,9 +115,7 @@ def find_names(fn_ast: ast.FunctionDef, ctx: inspect.ClosureVars) -> Set[str]:
     if ctx.unbound:
         raise CompileError(f'Function has unbound names {ctx.unbound}.')
     # TODO: filter closure variables to minimum necessary set.
-    closure_vars = set.union(*(set(v.keys())
-                               for v in (ctx.globals, ctx.nonlocals,
-                                         ctx.builtins)))
+    closure_vars = set(merge_closure_vars(ctx).keys())
     params = set(a.arg for a in fn_ast.args.args)
     closure_vars -= params
     bound_locals, _ = new_bindings(fn_ast.body, params, set(), closure_vars)
@@ -107,6 +124,17 @@ def find_names(fn_ast: ast.FunctionDef, ctx: inspect.ClosureVars) -> Set[str]:
 
 def new_bindings(statements: List[ast.AST], bound_locals: Set[str],
                  loaded_names: Set[str], closure_vars: Set[str]):
+    """Parses variable references in a list of statements.
+
+    Args:
+        statements: 
+    
+    We say that a local is unbound if either:
+        (a) Its name is neither in the closure variables nor was previously
+            on the l.h.s. of any assignment statement.
+        (b) Its name is in the closure context but is on the l.h.s. of some
+             assignment statement *after* its value is loaded.
+    """
     bound_locals = bound_locals.copy()
     loaded_names = loaded_names.copy()
 
@@ -134,11 +162,6 @@ def new_bindings(statements: List[ast.AST], bound_locals: Set[str],
             statement_visitor.visit(statement.value)
             loaded_names |= statement_visitor.loaded
 
-            # We say that a local is unbound if either:
-            #   (a) Its name is neither in the closure variables nor was previously
-            #       on the l.h.s. of any assignment statement.
-            #   (b) Its name is in the closure context but is on the l.h.s. of some
-            #       assignment statement *after* its value is loaded.
             targets = set(t.id for t in statement.targets)
             unbound_b = targets & loaded_names & closure_vars
             if unbound_b:
@@ -156,6 +179,80 @@ def new_bindings(statements: List[ast.AST], bound_locals: Set[str],
             raise CompileError(
                 f'Encountered invalid statement (type {type(statement)}).')
     return bound_locals, loaded_names
+
+
+class ExprNameToIDTransformer(ast.NodeVisitor):
+    """AST transformer that replaces names with IDs in an expression."""
+    def __init__(self, *args, name_to_id: Dict[str, int], **kwargs):
+        self.name_to_id = name_to_id
+
+    def visit_Name(self, node: ast.Name) -> ast.Name:
+        if isinstance(self.name_to_id[node.id],
+                      str) and self.name_to_id not in {'partition', 'store'}:
+            return ast.Name(id=self.name_to_id[node.id],
+                            expr_context=node.expr_context)
+        return node
+
+
+def replace_local_names_with_ids(source_ast: ast.AST,
+                                 name_to_id: Dict[str, int]) -> ast.AST:
+    name_to_id = name_to_id.copy()
+    new_names = {}
+    transformed_ast = deepcopy(source_ast)
+    if not hasattr(transformed_ast, 'body'):
+        raise CompileError('Cannot replace local names in non-statement.')
+
+    # TODO: We can imagine a case like the following:
+    #  def test_fn():
+    #    if <something>:
+    #      z = <intermediate value of type A>
+    #      y = int(z)
+    #    else:
+    #      z = <intermediate value of type B ≠ A>
+    #      y = int(z)
+    #   return y
+    #
+    # Because `z` is bound in both branches, we currently enforce type
+    # consistency on `z`. But this is unnecessarily strict, as we don't
+    # use `z` outside of the branches. One way to solve this problem is
+    # to introduce some slightly more sophisticated dataflow analysis.
+    # Another trick (a la tf.autograph) is to normalize the if/else bodies
+    # to inline functions.
+    for idx, statement in enumerate(transformed_ast.body):
+        if isinstance(statement, ast.If):
+            statement.test = ExprNameToIDTransformer(name_to_id).visit(
+                statement.test)
+            _, if_new_ids = replace_local_names_with_ids(
+                statement.body, name_to_id)
+            _, else_new_ids = replace_local_names_with_ids(
+                statement.orelse, name_to_id)
+            if_keys = set(if_new_ids.keys())
+            else_keys = set(else_new_ids.keys())
+            outer_offset = max(name_to_id.values()) + 1
+            for idx, name in enumerate(if_keys & else_keys):
+                new_names[name] = name_to_id[name] = idx + outer_offset
+            inner_offset = max(name_to_id.values()) + 1
+            body_name_to_id = {
+                **name_to_id,
+                **{
+                    name: idx + inner_offset
+                    for idx, name in enumerate(if_keys ^ else_keys)
+                }
+            }
+            transformed_ast.body[idx] = ExprNameToIDTransformer(
+                body_name_to_id).visit(statement)
+        elif isinstance(statement, ast.Assign):
+            statement.body = ExprNameToIDTransformer(name_to_id).visit(
+                statement.body)
+            lhs_name = statement.targets[0].id
+            if lhs_name not in name_to_id:
+                next_id = max(name_to_id.values()) + 1
+                new_names[lhs_name] = name_to_id[lhs_name] = next_id
+            statement.targets[0].id = name_to_id[lhs_name]
+        elif isinstance(statement, ast.Return):
+            transformed_ast.body[idx] = ExprNameToIDTransformer(
+                name_to_id).visit(statement)
+    return transformed_ast, new_names
 
 
 def type_graph_column(graph: Graph, column: str):
@@ -213,6 +310,68 @@ def load_function_ast(fn: Callable) -> ast.FunctionDef:
     return fn_ast
 
 
+def preprocess_ast(fn_ast: ast.FunctionDef,
+                   ctx: inspect.ClosureVars) -> ast.FunctionDef:
+    """Validates and transforms the AST of a compilable function.
+
+    First, we validate that the AST represents a function within the GerryOpt
+    DSL (this mostly involves verifying that no disallowed statement or
+    expression forms are used). Then, we normalize assignment expressions and
+    replace closed-over variable names with constants.
+
+    Args:
+        fn_ast: The raw function AST.
+        ctx: The function's closure variables.
+
+    Returns:
+        The AST of the transformed function.
+
+    Raises:
+        CompileError: If validation or transformation fails---that is, the
+        function is outside of the GerryOpt DSL, uses unbound locals, or
+        closes over non-primitive variables.
+    """
+    DSLValidationVisitor().visit(fn_ast)
+    fn_ast = AssignmentNormalizer().visit(fn_ast)
+    bound_locals, closure_vars = find_names(fn_ast, ctx)
+    all_closure_vals = merge_closure_vars(ctx)
+    filtered_closure_vals = {k: all_closure_vals[k] for k in closure_vars}
+    closed_ast = ClosureValuesTransformer(
+        vals=filtered_closure_vals).visit(fn_ast)
+    # TODO: replace parameter
+    replaced_ids_ast, _ = replace_local_names_with_ids(closed_ast, {})
+    for idx, statement in enumerate(replaced_ids_ast.body):
+        pass
+    return replaced_ids_ast
+
+
+TypeContext = TypeDelta = Dict[str, type]
+ReturnType = Optional[type]
+
+
+class CompiledAST:
+    pass
+
+
+def type_and_transform_expr(expr: ast.Expr,
+                            ctx: TypeContext) -> Tuple[type, CompiledAST]:
+    pass
+
+
+def type_and_transform_statement(
+        statement: ast.AST, ctx: TypeContext,
+        return_ctx: ReturnType) -> Tuple[TypeDelta, ReturnType, CompiledAST]:
+    if isinstance(statement, ast.Assign):
+        rhs_type, rhs_ast = type_and_transform_expr(statement.value)
+        lhs = statement.targets[0].id
+        if lhs in ctx and ctx[lhs] != rhs_type:
+            raise CompileError('')
+    elif isinstance(statement, ast.If):
+        pass
+    elif isinstance(statement, ast.Return):
+        pass
+
+
 def to_ast(fn: Callable, fn_type: str, graph: Graph, updaters: Updaters):
     """Compiles a function to a GerryOpt AST."""
     if fn_type not in ('accept', 'constraint', 'score'):
@@ -222,11 +381,7 @@ def to_ast(fn: Callable, fn_type: str, graph: Graph, updaters: Updaters):
 
     fn_context = inspect.getclosurevars(fn)
     raw_fn_ast = load_function_ast(fn)
-    DSLValidationVisitor().visit(raw_fn_ast)
-    fn_ast = AssignmentNormalizer().visit(raw_fn_ast)
-    # bound_locals, closure_vars = find_names(fn_ast, fn_context)
-    # fn_ast = ClosureValuesTransformer(closure_vars).visit(fn_ast)
-
+    fn_ast = preprocess_ast(raw_fn_ast, fn_context)
     for stmt in fn_ast.body:
         if isinstance(stmt, ast.Assign):
             pass
