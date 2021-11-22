@@ -1,11 +1,11 @@
 """Vector operations for the GerryOpt DSL."""
-from typing import List, TypeVar
+from typing import List, TypeVar, Generic
 from statistics import mean
 
 V = TypeVar('V')
 
 
-class Vector:
+class Vec(Generic[V]):
     """A GerryOpt vector."""
     def __init__(self, vals: List[V]):
         self._vals = vals

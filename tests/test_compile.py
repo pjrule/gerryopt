@@ -5,12 +5,15 @@ import networkx as nx
 from copy import copy
 from textwrap import dedent
 from inspect import getclosurevars as get_ctx
-from typing import Callable
+from typing import Callable, Union
 from gerryopt.compile import (LoadedNamesVisitor, preprocess_ast,
                               type_graph_column, tally_columns, CompileError,
                               to_ast, load_function_ast, type_updater_columns,
                               preprocess_ast, DSLValidationVisitor,
-                              AssignmentNormalizer, find_names)
+                              AssignmentNormalizer, find_names, always_returns,
+                              type_and_transform_expr, Constant, Name, UnaryOp,
+                              UnaryOpcode)
+from gerryopt.vector import Vec
 from gerrychain.updaters import Tally, cut_edges
 from gerrychain.grid import create_grid_graph
 
@@ -34,7 +37,7 @@ def always_accept_with_store(partition, store):
 
 def fn_to_ast(fn: Callable):
     """Helper for generating ASTs of test functions."""
-    return ast.parse(dedent(inspect.getsource(fn)))
+    return ast.parse(dedent(inspect.getsource(fn))).body[0]
 
 
 def ast_equal(a: ast.AST, b: ast.AST):
@@ -250,7 +253,7 @@ def test_find_names_simple_assignments():
         z = 2
         return x + y + z
 
-    locals, _ = find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    locals, _ = find_names(fn_to_ast(test_fn), get_ctx(test_fn))
     assert locals == {'x', 'y', 'z'}
 
 
@@ -259,7 +262,7 @@ def test_find_names_simple_unbound():
         return x
 
     with pytest.raises(CompileError):
-        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+        find_names(fn_to_ast(test_fn), get_ctx(test_fn))
 
 
 def test_find_names_elif_good():
@@ -274,7 +277,7 @@ def test_find_names_elif_good():
             y = 4
         return y + 1
 
-    locals, _ = find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    locals, _ = find_names(fn_to_ast(test_fn), get_ctx(test_fn))
     assert locals == {'x', 'y'}
 
 
@@ -288,7 +291,7 @@ def test_find_names_if_bad():
         return y + 1
 
     with pytest.raises(CompileError):
-        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+        find_names(fn_to_ast(test_fn), get_ctx(test_fn))
 
 
 def test_find_names_globals_nonlocals_good():
@@ -298,8 +301,7 @@ def test_find_names_globals_nonlocals_good():
         z = x + y  # uses nonlocal
         return always_accept  # uses global
 
-    locals, closure_vars = find_names(
-        fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    locals, closure_vars = find_names(fn_to_ast(test_fn), get_ctx(test_fn))
     assert locals == {'x', 'z'}
     assert closure_vars == {'y', 'always_accept'}
 
@@ -312,8 +314,7 @@ def test_find_names_globals_nonlocals_assignment_shadowing():
         z = x + y  # uses local that shadows nonlocal
         return always_accept  # uses global
 
-    locals, closure_vars = find_names(
-        fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    locals, closure_vars = find_names(fn_to_ast(test_fn), get_ctx(test_fn))
     assert locals == {'x', 'y', 'z'}
     assert closure_vars == {'always_accept'}
 
@@ -325,8 +326,7 @@ def test_find_names_globals_nonlocals_arg_shadowing():
         z = x + y  # uses nonlocal
         return always_accept  # uses local that shadows global
 
-    locals, closure_vars = find_names(
-        fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    locals, closure_vars = find_names(fn_to_ast(test_fn), get_ctx(test_fn))
     assert locals == {'x', 'z', 'always_accept'}
     assert closure_vars == {'y'}
 
@@ -341,7 +341,7 @@ def test_find_names_nonlocals_bad_ref_before_set():
             y += 2
 
     with pytest.raises(CompileError):
-        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+        find_names(fn_to_ast(test_fn), get_ctx(test_fn))
 
 
 def test_find_names_unbound_in_if_test():
@@ -351,7 +351,7 @@ def test_find_names_unbound_in_if_test():
         return 2
 
     with pytest.raises(CompileError):
-        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+        find_names(fn_to_ast(test_fn), get_ctx(test_fn))
 
 
 def test_find_names_unsupported_statement():
@@ -362,7 +362,7 @@ def test_find_names_unsupported_statement():
         return x
 
     with pytest.raises(CompileError):
-        find_names(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+        find_names(fn_to_ast(test_fn), get_ctx(test_fn))
 
 
 def test_preprocess_ast_nonlocal_substitution_primitives():
@@ -380,8 +380,8 @@ def test_preprocess_ast_nonlocal_substitution_primitives():
             return 1 + 2.0
         return a
 
-    expected_ast = fn_to_ast(test_fn_normalized).body[0]
-    actual_ast = preprocess_ast(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+    expected_ast = fn_to_ast(test_fn_normalized)
+    actual_ast = preprocess_ast(fn_to_ast(test_fn), get_ctx(test_fn))
     assert ast_equal(expected_ast, actual_ast)
 
 
@@ -392,4 +392,171 @@ def test_preprocess_ast_nonlocal_substitution_non_primitive():
         return x
 
     with pytest.raises(CompileError):
-        preprocess_ast(fn_to_ast(test_fn).body[0], get_ctx(test_fn))
+        preprocess_ast(fn_to_ast(test_fn), get_ctx(test_fn))
+
+
+def test_always_returns_no_branches_return():
+    def test_fn():
+        return 1
+
+    assert always_returns(fn_to_ast(test_fn))
+
+
+def test_always_returns_no_branches_return():
+    def test_fn():
+        return 1
+
+    assert always_returns(fn_to_ast(test_fn).body)
+
+
+def test_always_returns_no_branches_no_return():
+    def test_fn():
+        pass
+
+    assert not always_returns(fn_to_ast(test_fn).body)
+
+
+def test_always_returns_one_level_return():
+    def test_fn(x):
+        if x:
+            return 1
+        else:
+            return 2
+
+    assert always_returns(fn_to_ast(test_fn).body)
+
+
+def test_always_returns_one_level_asymmetric_return():
+    def test_fn(x):
+        if x:
+            return 1
+        return 2
+
+    assert always_returns(fn_to_ast(test_fn).body)
+
+
+def test_always_returns_one_level_no_return():
+    def test_fn(x):
+        if x:
+            return 1
+
+    assert not always_returns(fn_to_ast(test_fn).body)
+
+
+def test_always_returns_two_level_return():
+    def test_fn(x, y):
+        if x:
+            if y:
+                return 1
+            else:
+                return 2
+        else:
+            if y:
+                return 3
+            else:
+                return 4
+
+    assert always_returns(fn_to_ast(test_fn).body)
+
+
+def test_always_returns_two_level_asymmetric_return():
+    def test_fn(x, y):
+        if x:
+            if y:
+                return 1
+            return 2
+        else:
+            if not y:
+                return 4
+        return 3
+
+    assert always_returns(fn_to_ast(test_fn).body)
+
+
+def test_always_returns_two_level_asymmetric_no_return():
+    def test_fn(x, y):
+        if x:
+            if y:
+                return 1
+            return 2
+        else:
+            if not y:
+                return 4
+
+    assert not always_returns(fn_to_ast(test_fn).body)
+
+
+@pytest.mark.parametrize('val', [1, True, 1.0])
+def test_type_and_transform_expr_constant_primitive(val):
+    constant_ast = ast.Constant(value=val)
+    constant_type, transformed_ast = type_and_transform_expr(constant_ast)
+    assert constant_type == type(val)
+    assert transformed_ast == Constant(val)
+
+
+def test_type_and_transform_expr_constant_non_primitive():
+    constant_ast = ast.Constant(value='abc')
+    with pytest.raises(CompileError):
+        type_and_transform_expr(constant_ast)
+
+
+def test_type_and_transform_expr_name_in_context():
+    constant_ast = ast.Name(id='x', ctx=ast.Load())
+    ctx = {'x': Union[float, int]}
+    constant_type, transformed_ast = type_and_transform_expr(constant_ast, ctx)
+    assert constant_type == ctx['x']
+    assert transformed_ast == Name('x')
+
+
+def test_type_and_transform_expr_name_not_in_context():
+    constant_ast = ast.Name(id='x', ctx=ast.Load())
+    with pytest.raises(CompileError):
+        type_and_transform_expr(constant_ast)
+
+
+def test_type_and_transform_expr_name_store_context():
+    constant_ast = ast.Name(id='x', ctx=ast.Store())
+    ctx = {'x': Union[float, int]}
+    with pytest.raises(CompileError):
+        type_and_transform_expr(constant_ast, ctx)
+
+
+@pytest.mark.parametrize(
+    'operand_type,exp_type',
+    [
+        # primitive types
+        (int, int),
+        (bool, int),
+        (float, float),
+
+        # type unions of primitive types
+        (Union[int, bool], int),
+        (Union[int, float], Union[int, float]),
+        (Union[bool, float], Union[int, float]),
+        (Union[int, bool, float], Union[int, float]),
+
+        # vectors of primitive types
+        (Vec[int], Vec[int]),
+        (Vec[bool], Vec[int]),
+        (Vec[float], Vec[float]),
+
+        # type unions of vectors of primitive types
+        (Union[Vec[int], Vec[bool]], Vec[int]),
+        (Union[Vec[int], Vec[float]], Union[Vec[int], Vec[float]]),
+        (Union[Vec[bool], Vec[float]], Union[Vec[int], Vec[float]]),
+        (Union[Vec[int], Vec[bool], Vec[float]], Union[Vec[int], Vec[float]])
+    ])
+@pytest.mark.parametrize('op', ['-', '+'])
+def test_type_and_transform_expr_unary_op_uadd_usub(operand_type, exp_type,
+                                                    op):
+    if op == '-':
+        ast_op = ast.USub()
+        opcode = UnaryOpcode.USUB
+    elif op == '+':
+        ast_op = ast.UAdd()
+        opcode = UnaryOpcode.UADD
+    uop_ast = ast.UnaryOp(op=ast_op, operand=ast.Name(id='x', ctx=ast.Load()))
+    ctx = {'x': operand_type}
+    uop_type, transformed_ast = type_and_transform_expr(uop_ast, ctx)
+    assert uop_type == exp_type
+    assert transformed_ast == UnaryOp(opcode, Name('x'))

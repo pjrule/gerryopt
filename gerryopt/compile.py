@@ -1,12 +1,17 @@
 """Compiler/transpiler for the GerryOpt DSL."""
 import ast
+import json
 import inspect
 from copy import deepcopy
 from textwrap import dedent
-from dataclasses import dataclass, field
-from typing import Callable, Iterable, Set, Dict, List, Union, Any, Optional, Tuple
+from dataclasses import dataclass, field, is_dataclass, asdict
+from enum import Enum
+from itertools import product
+from typing import (Callable, Iterable, Set, Dict, List, Union, Any, Optional,
+                    Tuple, get_args)
 from gerrychain import Graph
 from gerrychain.updaters import Tally
+from gerryopt.vector import Vec
 
 PRIMITIVE_TYPES = [int, float, bool]
 DSL_DISALLOWED_STATEMENTS = {
@@ -55,7 +60,7 @@ class AssignmentNormalizer(ast.NodeTransformer):
     them. Multiple-target assignment (e.g. `x, y = y, x`) is not allowed.
     """
     def visit_Assign(self, node: ast.Assign) -> ast.Assign:
-        if len(node.targets) > 1:
+        if isinstance(node.targets[0], ast.Tuple):
             # TODO
             raise CompileError(
                 'Multiple-target assignment not supported by the GerryChain DSL.'
@@ -181,80 +186,6 @@ def new_bindings(statements: List[ast.AST], bound_locals: Set[str],
     return bound_locals, loaded_names
 
 
-class ExprNameToIDTransformer(ast.NodeVisitor):
-    """AST transformer that replaces names with IDs in an expression."""
-    def __init__(self, *args, name_to_id: Dict[str, int], **kwargs):
-        self.name_to_id = name_to_id
-
-    def visit_Name(self, node: ast.Name) -> ast.Name:
-        if isinstance(self.name_to_id[node.id],
-                      str) and self.name_to_id not in {'partition', 'store'}:
-            return ast.Name(id=self.name_to_id[node.id],
-                            expr_context=node.expr_context)
-        return node
-
-
-def replace_local_names_with_ids(source_ast: ast.AST,
-                                 name_to_id: Dict[str, int]) -> ast.AST:
-    name_to_id = name_to_id.copy()
-    new_names = {}
-    transformed_ast = deepcopy(source_ast)
-    if not hasattr(transformed_ast, 'body'):
-        raise CompileError('Cannot replace local names in non-statement.')
-
-    # TODO: We can imagine a case like the following:
-    #  def test_fn():
-    #    if <something>:
-    #      z = <intermediate value of type A>
-    #      y = int(z)
-    #    else:
-    #      z = <intermediate value of type B ≠ A>
-    #      y = int(z)
-    #   return y
-    #
-    # Because `z` is bound in both branches, we currently enforce type
-    # consistency on `z`. But this is unnecessarily strict, as we don't
-    # use `z` outside of the branches. One way to solve this problem is
-    # to introduce some slightly more sophisticated dataflow analysis.
-    # Another trick (a la tf.autograph) is to normalize the if/else bodies
-    # to inline functions.
-    for idx, statement in enumerate(transformed_ast.body):
-        if isinstance(statement, ast.If):
-            statement.test = ExprNameToIDTransformer(name_to_id).visit(
-                statement.test)
-            _, if_new_ids = replace_local_names_with_ids(
-                statement.body, name_to_id)
-            _, else_new_ids = replace_local_names_with_ids(
-                statement.orelse, name_to_id)
-            if_keys = set(if_new_ids.keys())
-            else_keys = set(else_new_ids.keys())
-            outer_offset = max(name_to_id.values()) + 1
-            for idx, name in enumerate(if_keys & else_keys):
-                new_names[name] = name_to_id[name] = idx + outer_offset
-            inner_offset = max(name_to_id.values()) + 1
-            body_name_to_id = {
-                **name_to_id,
-                **{
-                    name: idx + inner_offset
-                    for idx, name in enumerate(if_keys ^ else_keys)
-                }
-            }
-            transformed_ast.body[idx] = ExprNameToIDTransformer(
-                body_name_to_id).visit(statement)
-        elif isinstance(statement, ast.Assign):
-            statement.body = ExprNameToIDTransformer(name_to_id).visit(
-                statement.body)
-            lhs_name = statement.targets[0].id
-            if lhs_name not in name_to_id:
-                next_id = max(name_to_id.values()) + 1
-                new_names[lhs_name] = name_to_id[lhs_name] = next_id
-            statement.targets[0].id = name_to_id[lhs_name]
-        elif isinstance(statement, ast.Return):
-            transformed_ast.body[idx] = ExprNameToIDTransformer(
-                name_to_id).visit(statement)
-    return transformed_ast, new_names
-
-
 def type_graph_column(graph: Graph, column: str):
     """Determines the type of a column in `graph`."""
     column_types = set(type(v) for _, v in graph.nodes(column))
@@ -292,6 +223,25 @@ def type_updater_columns(graph: Graph, updaters: Updaters) -> Dict:
     if set(column_types.values()) - set(PRIMITIVE_TYPES):
         raise CompileError('Tallies with non-primitive types not supported.')
     return column_types
+
+
+def always_returns(statements: List[ast.AST]) -> bool:
+    """Determines if a list of statements is guaranteed to `return`."""
+    # Recursively:
+    #  * If the list of statements contains ≥1 return statements and
+    #    does not branch (no if block), we are guaranteed to return.
+    #  * If the list of statements *does* contain ≥1 if block, then
+    #    (recursively) both parts of the block should be guaranteed to
+    #    return *or* there should be a return statement *after* the block.
+    for statement in statements:
+        if isinstance(statement, ast.Return):
+            return True
+        if isinstance(statement, ast.If):
+            if_returns = always_returns(statement.body)
+            else_returns = always_returns(statement.orelse)
+            if if_returns and else_returns:
+                return True
+    return False
 
 
 def load_function_ast(fn: Callable) -> ast.FunctionDef:
@@ -338,38 +288,327 @@ def preprocess_ast(fn_ast: ast.FunctionDef,
     filtered_closure_vals = {k: all_closure_vals[k] for k in closure_vars}
     closed_ast = ClosureValuesTransformer(
         vals=filtered_closure_vals).visit(fn_ast)
-    # TODO: replace parameter
-    replaced_ids_ast, _ = replace_local_names_with_ids(closed_ast, {})
-    for idx, statement in enumerate(replaced_ids_ast.body):
-        pass
-    return replaced_ids_ast
+    if not always_returns(closed_ast.body):
+        raise CompileError(
+            'GerryOpt functions must always return a non-`None` value.')
+    return closed_ast
+
+
+def is_truthy(t: type) -> bool:
+    """Determines if a type is considered truthy in the GerryOpt DSL."""
+    return isinstance(t, get_args(Primitive))
+
+
+def scalar_type(t: type) -> type:
+    """Returns the type of an element X of a Vec[X] (identity otherwise)."""
+    if isinstance(t, Vec):
+        return get_args(t)[0]
+    return t
+
+
+def is_vec(t: type) -> bool:
+    """Determines if a type is an instance of Vec[T]."""
+    return isinstance(t, Vec)
+
+
+class UndefinedVar:
+    """A pseudotype for possibly undefined variables."""
 
 
 TypeContext = TypeDelta = Dict[str, type]
 ReturnType = Optional[type]
+CompiledIdentifier = str
 
 
-class CompiledAST:
+class AST:
+    pass
+
+
+class Expr(AST):
+    pass
+
+
+class Statement(AST):
     pass
 
 
 def type_and_transform_expr(expr: ast.Expr,
-                            ctx: TypeContext) -> Tuple[type, CompiledAST]:
-    pass
+                            ctx: TypeContext) -> Tuple[type, Expr]:
+    raise NotImplementedError('stub for typing')
 
 
-def type_and_transform_statement(
-        statement: ast.AST, ctx: TypeContext,
-        return_ctx: ReturnType) -> Tuple[TypeDelta, ReturnType, CompiledAST]:
-    if isinstance(statement, ast.Assign):
-        rhs_type, rhs_ast = type_and_transform_expr(statement.value)
+def type_and_transform_statements(
+        statements: List[ast.AST], ctx: TypeContext, return_type: ReturnType
+) -> Tuple[TypeDelta, ReturnType, List[Statement]]:
+    raise NotImplementedError('stub for typing')
+
+
+def ctx_union(ctx: TypeContext, name: str, *args: type) -> type:
+    if name in ctx:
+        return Union[ctx[name], args]
+    return Union[args]
+
+
+def type_product(*args: type) -> Iterable:
+    """Generates the Cartesian product of (union) types."""
+    unrolled = [get_args(t) if isinstance(t, Union) else (t, ) for t in args]
+    return product(unrolled)
+
+
+@dataclass
+class If(Statement):
+    test: Expr
+    body: List['Statement']
+    orelse: List['Statement']
+
+    def type_and_transform(
+            cls, statement: ast.If, ctx: TypeContext, return_type: ReturnType
+    ) -> Tuple[TypeDelta, ReturnType, Statement]:
+        delta = {}
+        test_type, test_ast = type_and_transform_expr(statement.test)
+        if_types, if_return_type, if_asts = type_and_transform_statements(
+            statement.body, ctx, return_type)
+        else_types, else_return_type, else_asts = type_and_transform_statements(
+            statement.orelse, ctx, return_type)
+        if_names = set(if_types.keys())
+        else_names = set(else_types.keys())
+        for name in if_names & else_names:
+            delta[name] = ctx_union(ctx, if_types[name], else_types[name])
+        for name in if_names - else_names:
+            delta[name] = ctx_union(ctx, if_types[name], UndefinedVar)
+        for name in else_names - if_names:
+            delta[name] = ctx_union(ctx, else_types[name], UndefinedVar)
+        if if_return_type is not None:
+            return_type = Union[return_type, if_return_type]
+        if else_return_type is not None:
+            return_type = Union[return_type, else_return_type]
+        return delta, return_type, cls(test_ast, if_asts, else_asts)
+
+
+@dataclass
+class Return(Statement):
+    value: Expr
+
+    @classmethod
+    def type_and_transform(cls, statement: ast.If,
+                           ctx: TypeContext) -> Tuple[ReturnType, Statement]:
+        branch_return_type, return_ast = type_and_transform_expr(
+            statement.value, ctx)
+        return branch_return_type, Return(return_ast)
+
+
+@dataclass
+class Assign(Statement):
+    target: CompiledIdentifier
+    value: Expr
+
+    @classmethod
+    def type_and_transform(cls, statement: ast.Assign,
+                           ctx: TypeContext) -> Tuple[TypeDelta, Statement]:
+        delta = {}
+        rhs_type, rhs_ast = type_and_transform_expr(statement.value, ctx)
         lhs = statement.targets[0].id
-        if lhs in ctx and ctx[lhs] != rhs_type:
-            raise CompileError('')
-    elif isinstance(statement, ast.If):
-        pass
-    elif isinstance(statement, ast.Return):
-        pass
+        if lhs in ctx:
+            ctx[lhs] = Union[ctx[lhs], rhs_type]
+        else:
+            ctx[lhs] = rhs_type
+        delta[lhs] = ctx[lhs]
+        return delta, cls(lhs, rhs_ast)
+
+
+@dataclass
+class Name(Expr):
+    id: CompiledIdentifier
+
+    @classmethod
+    def type_and_transform(cls, expr: ast.Name,
+                           ctx: TypeContext) -> Tuple[type, 'Name']:
+        if isinstance(expr.ctx, ast.Store):
+            raise CompileError('Cannot type name in store context.')
+        try:
+            return ctx[expr.id], Name(expr.id)
+        except KeyError:
+            raise CompileError(
+                f'Could not resolve type for unbound local "{expr.id}".')
+
+
+@dataclass
+class Constant(Expr):
+    value: Primitive
+
+    @classmethod
+    def type_and_transform(cls, expr: ast.Constant,
+                           ctx: TypeContext) -> Tuple[type, 'Constant']:
+        val = expr.value
+        if isinstance(val, get_args(Primitive)):
+            return type(val), Constant(val)
+        raise CompileError(f'Cannot type non-primitive constant {val}')
+
+
+BoolOpcode = Enum('BoolOpcode', 'AND OR')
+
+
+@dataclass
+class BoolOp(Expr):
+    op: BoolOpcode
+    values: List[Expr]
+    OPS = {ast.And: BoolOpcode.AND, ast.Or: BoolOpcode.OR}
+
+    @classmethod
+    def type_and_transform(cls, expr: ast.BoolOp,
+                           ctx: TypeContext) -> Tuple[type, 'BoolOp']:
+        arg_types, arg_asts = list(
+            zip(*(type_and_transform_expr(e, ctx) for e in expr.values)))
+        if not all(is_truthy(scalar_type(t)) for t in arg_types):
+            raise CompileError(
+                'All arguments to a boolean operator must be truthy.')
+        compiled_expr = cls(BoolOp.OPS[type(expr.op)], arg_asts)
+        if any(is_vec(t) for t in arg_types):
+            if all(is_vec(t) for t in arg_types):
+                return Vec[bool], compiled_expr
+            raise CompileError(
+                'Cannot mix scalar and vector boolean operations.')
+        return bool, compiled_expr
+
+
+UnaryOpcode = Enum('UnaryOpcode', 'UADD USUB INVERT NOT')
+
+
+@dataclass
+class UnaryOp(Expr):
+    op: UnaryOpcode
+    operand: Expr
+
+    OPS = {
+        ast.UAdd: UnaryOpcode.UADD,
+        ast.USub: UnaryOpcode.USUB,
+        ast.Invert: UnaryOpcode.INVERT,
+        ast.Not: UnaryOpcode.NOT,
+    }
+    OP_TYPES = {
+        (ast.UAdd, float): float,
+        (ast.USub, float): float,
+        # Invert not supported on floats
+        (ast.Not, float): bool,
+        (ast.UAdd, int): int,
+        (ast.USub, int): int,
+        (ast.Invert, int): int,
+        (ast.Not, int): bool,
+        (ast.UAdd, bool): int,
+        (ast.USub, bool): int,
+        (ast.Invert, bool): int,
+        (ast.Not, int): bool,
+    }
+
+    @classmethod
+    def type_and_transform(cls, expr: ast.UnaryOp,
+                           ctx: TypeContext) -> Tuple[type, 'UnaryOp']:
+        operand_type, operand_ast = type_and_transform_expr(expr.operand, ctx)
+        expr_ast = cls(UnaryOp.OPS[expr.op], operand_ast)
+        try:
+            expr_type = UnaryOp.OP_TYPES[(expr.op, scalar_type(operand_type))]
+            if is_vec(operand_type):
+                return Vec[expr_type], expr_ast
+            return expr_type, expr_ast
+        except KeyError:
+            raise CompileError(
+                f'Unary operation {expr.op} not supported for type {operand_type}.'
+            )
+
+
+@dataclass
+class IfExpr(Expr):
+    test: Expr
+    body: Expr
+    orelse: Expr
+
+    @classmethod
+    def type_and_transform(cls, expr: ast.Expr,
+                           ctx: TypeContext) -> Tuple[type, 'IfExpr']:
+        test_type, test_ast = type_and_transform_expr(expr.test, ctx)
+        if_type, if_ast = type_and_transform_expr(expr.body, ctx)
+        else_type, else_ast = type_and_transform_expr(expr.orelse, ctx)
+        if not is_truthy(test_type):
+            raise CompileError('Test in conditional expression is not truthy.')
+        return Union[if_type, else_type], cls(test_ast, if_ast, else_ast)
+
+
+CmpOpcode = Enum('CmpOpcode', 'EQ NOT_EQ LT LTE GT GTE')
+
+
+@dataclass
+class CmpOp(Expr):
+    OPS = {
+        ast.Eq: CmpOpcode.EQ,
+        ast.NotEq: CmpOpcode.NOT_EQ,
+        ast.Lt: CmpOpcode.LT,
+        ast.LtE: CmpOpcode.LTE,
+        ast.Gt: CmpOpcode.GT,
+        ast.GtE: CmpOpcode.GTE,
+    }
+
+
+class ASTEncoder(json.JSONEncoder):
+    """JSON serializer for compiled ASTs."""
+
+    # dataclass encoding: https://stackoverflow.com/a/51286749
+    def default(self, o):
+        if is_dataclass(o):
+            # TODO: inject node type.
+            return asdict(o)
+        return super().default(o)
+
+
+AST_EXPR_TO_COMPILED = {
+    ast.UnaryOp: UnaryOp,
+    ast.BoolOp: BoolOp,
+    ast.Compare: CmpOp,
+    ast.IfExp: IfExpr,
+    ast.Constant: Constant,
+    ast.Name: Name
+}
+
+
+def type_and_transform_expr(
+        expr: ast.Expr,
+        ctx: Optional[TypeContext] = None) -> Tuple[type, Expr]:
+    if ctx is None:
+        ctx = {}
+    try:
+        return AST_EXPR_TO_COMPILED[type(expr)].type_and_transform(expr, ctx)
+    except KeyError:
+        raise CompileError(f'expression type {type(expr)} unsupported or TODO')
+
+
+def type_and_transform_statements(
+        statements: List[ast.AST], ctx: TypeContext, return_type: ReturnType
+) -> Tuple[TypeDelta, ReturnType, List[Statement]]:
+    new_ctx = ctx.copy()
+    compiled_statements = []
+    delta = {}
+    for statement in statements:
+        new_return_type = None
+        if isinstance(statement, ast.Assign):
+            stmt_delta, statement = Assign.type_and_transform(statement, ctx)
+        elif isinstance(statement, ast.If):
+            stmt_delta, new_return_type, statement = If.type_and_transform(
+                statement, ctx, return_type)
+        elif isinstance(statement, ast.Return):
+            new_return_type, statement = Return.type_and_transform(
+                statement, ctx)
+        else:
+            raise CompileError(
+                f'Encountered invalid statement (type {type(statement)}).')
+
+        compiled_statements.append(statement)
+        for name, t in stmt_delta.items():
+            delta[name] = new_ctx[name] = ctx_union(ctx, t)
+        if return_type is None and new_return_type is not None:
+            return_type = new_return_type
+        else:
+            return_type = Union[return_type, new_return_type]
+
+    return delta, return_type, compiled_statements
 
 
 def to_ast(fn: Callable, fn_type: str, graph: Graph, updaters: Updaters):
