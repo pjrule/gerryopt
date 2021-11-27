@@ -296,7 +296,9 @@ def preprocess_ast(fn_ast: ast.FunctionDef,
 
 def is_truthy(t: type) -> bool:
     """Determines if a type is considered truthy in the GerryOpt DSL."""
-    return isinstance(t, get_args(Primitive))
+    if get_origin(t) is Union:
+        return all(member_t in PRIMITIVE_TYPES for member_t in get_args(t))
+    return t in PRIMITIVE_TYPES
 
 
 def scalar_type(t: type) -> type:
@@ -343,12 +345,6 @@ def type_and_transform_statements(
     raise NotImplementedError('stub for typing')
 
 
-def ctx_union(ctx: TypeContext, name: str, *args: type) -> type:
-    if name in ctx:
-        return Union[ctx[name], args]
-    return Union[args]
-
-
 def type_union(*args: type) -> Optional[type]:
     """Finds the union of types, eliminating `None` where possible."""
     union_t = None
@@ -360,11 +356,22 @@ def type_union(*args: type) -> Optional[type]:
     return union_t
 
 
+def ctx_union(ctx: TypeContext, name: str, *args: type) -> type:
+    """Finds the union of types with the existing type of `name` in `ctx`.
+
+    If `name` is not available in `ctx`, we simply find the union of
+    the directly passed types.
+    """
+    if name in ctx:
+        return type_union(ctx[name], *args)
+    return type_union(*args)
+
+
 def defined_type_product(*args: type) -> Iterable:
     """Generates the Cartesian product of (union) types.
     
     Raises:
-        CompileError: If a product contains `UndefinedVar`.
+        CompileError: If the product contains `UndefinedVar`.
     """
     unrolled = [get_args(t) if get_origin(t) is Union else (t, ) for t in args]
     for types in unrolled:
@@ -517,7 +524,7 @@ class UnaryOp(Expr):
         (ast.UAdd, bool): int,
         (ast.USub, bool): int,
         (ast.Invert, bool): int,
-        (ast.Not, int): bool,
+        (ast.Not, bool): bool,
     }
 
     @classmethod

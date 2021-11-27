@@ -5,17 +5,48 @@ import networkx as nx
 from copy import copy
 from textwrap import dedent
 from inspect import getclosurevars as get_ctx
-from typing import Callable, Union
-from gerryopt.compile import (LoadedNamesVisitor, preprocess_ast,
-                              type_graph_column, tally_columns, CompileError,
-                              to_ast, load_function_ast, type_updater_columns,
-                              preprocess_ast, DSLValidationVisitor,
-                              AssignmentNormalizer, find_names, always_returns,
-                              type_and_transform_expr, Constant, Name, UnaryOp,
-                              UnaryOpcode)
+from typing import Callable, Union, get_args
+from gerryopt.compile import (
+    LoadedNamesVisitor, UndefinedVar, ctx_union, defined_type_product, is_vec,
+    preprocess_ast, scalar_type, type_graph_column, tally_columns,
+    CompileError, to_ast, load_function_ast, type_union, type_updater_columns,
+    preprocess_ast, DSLValidationVisitor, AssignmentNormalizer, find_names,
+    always_returns, type_and_transform_expr, Constant, Name, UnaryOp,
+    UnaryOpcode, is_truthy)
 from gerryopt.vector import Vec
 from gerrychain.updaters import Tally, cut_edges
 from gerrychain.grid import create_grid_graph
+from itertools import product
+
+SIMPLE_PRIMITIVE_TYPES = [
+    int,
+    bool,
+    float,
+]
+
+PRIMITIVE_TYPE_UNIONS = [
+    Union[int, bool],
+    Union[int, float],
+    Union[bool, float],
+    Union[int, bool, float],
+]
+
+SIMPLE_VEC_TYPES = [Vec[int], Vec[bool], Vec[float]]
+
+VEC_TYPE_UNIONS = [
+    Union[Vec[int], Vec[bool]],
+    Union[Vec[int], Vec[float]],
+    Union[Vec[bool], Vec[float]],
+    Union[Vec[int], Vec[bool], Vec[float]],
+]
+
+VEC_TYPES = SIMPLE_VEC_TYPES + VEC_TYPE_UNIONS
+
+PRIMITIVE_TYPES = SIMPLE_PRIMITIVE_TYPES + PRIMITIVE_TYPE_UNIONS
+
+SIMPLE_TYPES = SIMPLE_PRIMITIVE_TYPES + SIMPLE_VEC_TYPES
+
+TYPE_UNIONS = PRIMITIVE_TYPE_UNIONS + VEC_TYPE_UNIONS
 
 
 @pytest.fixture
@@ -560,3 +591,148 @@ def test_type_and_transform_expr_unary_op_uadd_usub(operand_type, exp_type,
     uop_type, transformed_ast = type_and_transform_expr(uop_ast, ctx)
     assert uop_type == exp_type
     assert transformed_ast == UnaryOp(opcode, Name('x'))
+
+
+@pytest.mark.parametrize('operand_type,exp_type',
+                         ([(t, bool)
+                           for t in PRIMITIVE_TYPES] + [(t, Vec[bool])
+                                                        for t in VEC_TYPES]))
+def test_type_and_transform_expr_unary_op_not(operand_type, exp_type):
+    uop_ast = ast.UnaryOp(op=ast.Not(),
+                          operand=ast.Name(id='x', ctx=ast.Load()))
+    ctx = {'x': operand_type}
+    uop_type, transformed_ast = type_and_transform_expr(uop_ast, ctx)
+    assert uop_type == exp_type
+    assert transformed_ast == UnaryOp(UnaryOpcode.NOT, Name('x'))
+
+
+@pytest.mark.parametrize('operand_type,exp_type', [
+    (int, int),
+    (bool, int),
+    (Union[int, bool], int),
+    (Vec[int], Vec[int]),
+    (Vec[bool], Vec[int]),
+    (Union[Vec[int], Vec[bool]], Vec[int]),
+])
+def test_type_and_transform_expr_unary_op_invert(operand_type, exp_type):
+    uop_ast = ast.UnaryOp(op=ast.Invert(),
+                          operand=ast.Name(id='x', ctx=ast.Load()))
+    ctx = {'x': operand_type}
+    uop_type, transformed_ast = type_and_transform_expr(uop_ast, ctx)
+    assert uop_type == exp_type
+    assert transformed_ast == UnaryOp(UnaryOpcode.INVERT, Name('x'))
+
+
+@pytest.mark.parametrize('t', PRIMITIVE_TYPES)
+def test_is_truthy_primitives(t):
+    assert is_truthy(t)
+
+
+@pytest.mark.parametrize('t', VEC_TYPES)
+def test_is_truthy_non_primitives(t):
+    assert not is_truthy(t)
+
+
+@pytest.mark.parametrize('t', PRIMITIVE_TYPES)
+def test_is_vec_primitives(t):
+    assert not is_vec(t)
+
+
+@pytest.mark.parametrize('t', SIMPLE_VEC_TYPES)
+def test_is_vec_simple_vec_types(t):
+    assert is_vec(t)
+
+
+@pytest.mark.parametrize('t', VEC_TYPE_UNIONS)
+def test_is_vec_vec_type_unions(t):
+    assert not is_vec(t)
+
+
+@pytest.mark.parametrize('t', PRIMITIVE_TYPES + VEC_TYPE_UNIONS)
+def test_scalar_type_identity(t):
+    assert scalar_type(t) == t
+
+
+@pytest.mark.parametrize('t', SIMPLE_VEC_TYPES)
+def test_scalar_type_vecs(t):
+    assert scalar_type(t) == get_args(t)[0]
+
+
+def test_type_union_primitives():
+    assert type_union(float, int, bool) == Union[float, int, bool]
+
+
+def test_type_union_primitives_none():
+    assert type_union(float, None, int, bool) == Union[float, int, bool]
+
+
+def test_type_union_unions_primitive():
+    assert type_union(Union[float, int], Union[int, bool]) == Union[float, int,
+                                                                    bool]
+
+
+def test_type_union_primitives_unions_primitive_none():
+    assert type_union(Union[float, int], None, bool) == Union[float, int, bool]
+
+
+def test_type_union_primitives_unions_none():
+    assert type_union(Union[float, int], None,
+                      Union[int, bool]) == Union[float, int, bool]
+
+
+def test_type_union_no_args():
+    assert type_union() is None
+
+
+def test_type_union_none_arg():
+    assert type_union(None) is None
+
+
+def test_ctx_union_not_in_context_primitive():
+    assert ctx_union({}, 'x', int) == int
+
+
+def test_ctx_union_not_in_context_primitive_union():
+    assert ctx_union({}, 'x', float, int) == Union[float, int]
+
+
+def test_ctx_union_in_context_primitive_same():
+    assert ctx_union({'x': int}, 'x', int) == int
+
+
+def test_ctx_union_in_context_primitive_different():
+    assert ctx_union({'x': float}, 'x', int) == Union[int, float]
+
+
+def test_ctx_union_not_in_context_primitive_union():
+    assert ctx_union({'x': Union[int, float]}, 'x',
+                     Union[float, bool]) == Union[float, int, bool]
+
+
+@pytest.mark.parametrize('t', SIMPLE_TYPES)
+def test_defined_type_product_simple_type(t):
+    assert list(defined_type_product(t)) == [(t, )]
+
+
+def test_defined_type_product_undefined():
+    with pytest.raises(CompileError):
+        defined_type_product(UndefinedVar)
+
+
+@pytest.mark.parametrize('t', TYPE_UNIONS)
+def test_defined_type_product_type_union(t):
+    assert set(defined_type_product(t)) == set((t, ) for t in get_args(t))
+
+
+@pytest.mark.parametrize('t', TYPE_UNIONS)
+def test_defined_type_product_type_union_undefined(t):
+    with pytest.raises(CompileError):
+        defined_type_product(t, UndefinedVar)
+
+
+@pytest.mark.parametrize('t', SIMPLE_TYPES)
+def test_defined_type_product_simple_type_pairs(t):
+    assert list(defined_type_product(t, t)) == [(t, t)]
+
+
+# TODO: more tests for defined_type_product and UnaryOp
