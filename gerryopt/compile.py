@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, is_dataclass, asdict
 from enum import Enum
 from itertools import product
 from typing import (Callable, Iterable, Set, Dict, List, Union, Any, Optional,
-                    Tuple, get_args)
+                    Tuple, get_args, get_origin)
 from gerrychain import Graph
 from gerrychain.updaters import Tally
 from gerryopt.vector import Vec
@@ -301,14 +301,14 @@ def is_truthy(t: type) -> bool:
 
 def scalar_type(t: type) -> type:
     """Returns the type of an element X of a Vec[X] (identity otherwise)."""
-    if isinstance(t, Vec):
+    if get_origin(t) is Vec:
         return get_args(t)[0]
     return t
 
 
 def is_vec(t: type) -> bool:
     """Determines if a type is an instance of Vec[T]."""
-    return isinstance(t, Vec)
+    return get_origin(t) is Vec
 
 
 class UndefinedVar:
@@ -349,10 +349,30 @@ def ctx_union(ctx: TypeContext, name: str, *args: type) -> type:
     return Union[args]
 
 
-def type_product(*args: type) -> Iterable:
-    """Generates the Cartesian product of (union) types."""
-    unrolled = [get_args(t) if isinstance(t, Union) else (t, ) for t in args]
-    return product(unrolled)
+def type_union(*args: type) -> Optional[type]:
+    """Finds the union of types, eliminating `None` where possible."""
+    union_t = None
+    for t in args:
+        if union_t is None:
+            union_t = t
+        elif t is not None:
+            union_t = Union[union_t, t]
+    return union_t
+
+
+def defined_type_product(*args: type) -> Iterable:
+    """Generates the Cartesian product of (union) types.
+    
+    Raises:
+        CompileError: If a product contains `UndefinedVar`.
+    """
+    unrolled = [get_args(t) if get_origin(t) is Union else (t, ) for t in args]
+    for types in unrolled:
+        if UndefinedVar in types:
+            raise CompileError(
+                'Cannot compute type product for potentially undefined variables.'
+            )
+    return product(*unrolled)
 
 
 @dataclass
@@ -504,16 +524,25 @@ class UnaryOp(Expr):
     def type_and_transform(cls, expr: ast.UnaryOp,
                            ctx: TypeContext) -> Tuple[type, 'UnaryOp']:
         operand_type, operand_ast = type_and_transform_expr(expr.operand, ctx)
-        expr_ast = cls(UnaryOp.OPS[expr.op], operand_ast)
+        type_lb = None
+        op_type = type(expr.op)
         try:
-            expr_type = UnaryOp.OP_TYPES[(expr.op, scalar_type(operand_type))]
-            if is_vec(operand_type):
-                return Vec[expr_type], expr_ast
-            return expr_type, expr_ast
+            expr_ast = cls(UnaryOp.OPS[op_type], operand_ast)
         except KeyError:
-            raise CompileError(
-                f'Unary operation {expr.op} not supported for type {operand_type}.'
-            )
+            raise CompileError(f'Unary operation {op_type} not supported.')
+
+        for (t, ) in defined_type_product(operand_type):
+            try:
+                expr_type = UnaryOp.OP_TYPES[(op_type, scalar_type(t))]
+            except KeyError:
+                raise CompileError(
+                    f'Unary operation {op_type} not supported for type {t}.')
+            if is_vec(t):
+                type_lb = type_union(Vec[expr_type], type_lb)
+            else:
+                type_lb = type_union(expr_type, type_lb)
+
+        return type_lb, expr_ast
 
 
 @dataclass
