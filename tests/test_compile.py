@@ -653,6 +653,28 @@ def test_type_and_transform_expr_bool_op_primitive_triples(
     assert transformed_ast == BoolOp(opcode, (Name('x'), Name('y'), Name('z')))
 
 
+def test_type_and_transform_expr_bool_op_non_truthy_vecs():
+    bool_op_ast = ast.BoolOp(op=ast.And(),
+                             values=[
+                                 ast.Name(id='x', ctx=ast.Load()),
+                                 ast.Name(id='y', ctx=ast.Load())
+                             ])
+    ctx = {'x': Vec[bool], 'y': Vec[bool]}
+    with pytest.raises(CompileError):
+        type_and_transform_expr(bool_op_ast, ctx)
+
+
+def test_type_and_transform_expr_bool_op_non_truthy_mixed():
+    bool_op_ast = ast.BoolOp(op=ast.Or(),
+                             values=[
+                                 ast.Name(id='x', ctx=ast.Load()),
+                                 ast.Name(id='y', ctx=ast.Load())
+                             ])
+    ctx = {'x': Vec[bool], 'y': bool}
+    with pytest.raises(CompileError):
+        type_and_transform_expr(bool_op_ast, ctx)
+
+
 @pytest.fixture
 def if_expr_ast():
     return ast.IfExp(test=ast.Name(id='x', ctx=ast.Load()),

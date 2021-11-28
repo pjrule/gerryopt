@@ -486,15 +486,10 @@ class BoolOp(Expr):
                            ctx: TypeContext) -> Tuple[type, 'BoolOp']:
         arg_types, arg_asts = list(
             zip(*(type_and_transform_expr(e, ctx) for e in expr.values)))
-        if not all(is_truthy(scalar_type(t)) for t in arg_types):
+        if not all(is_truthy(t) for t in arg_types):
             raise CompileError(
                 'All arguments to a boolean operator must be truthy.')
         compiled_expr = cls(BoolOp.OPS[type(expr.op)], arg_asts)
-        if any(is_vec(t) for t in arg_types):
-            if all(is_vec(t) for t in arg_types):
-                return Vec[bool], compiled_expr
-            raise CompileError(
-                'Cannot mix scalar and vector boolean operations.')
         return bool, compiled_expr
 
 
