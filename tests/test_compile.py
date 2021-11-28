@@ -7,12 +7,12 @@ from textwrap import dedent
 from inspect import getclosurevars as get_ctx
 from typing import Callable, Union, get_args
 from gerryopt.compile import (
-    LoadedNamesVisitor, UndefinedVar, ctx_union, defined_type_product, is_vec,
-    preprocess_ast, scalar_type, type_graph_column, tally_columns,
-    CompileError, to_ast, load_function_ast, type_union, type_updater_columns,
-    preprocess_ast, DSLValidationVisitor, AssignmentNormalizer, find_names,
-    always_returns, type_and_transform_expr, Constant, Name, UnaryOp,
-    UnaryOpcode, is_truthy)
+    BoolOp, BoolOpcode, IfExpr, LoadedNamesVisitor, UndefinedVar, ctx_union,
+    defined_type_product, is_vec, preprocess_ast, scalar_type,
+    type_graph_column, tally_columns, CompileError, to_ast, load_function_ast,
+    type_union, type_updater_columns, preprocess_ast, DSLValidationVisitor,
+    AssignmentNormalizer, find_names, always_returns, type_and_transform_expr,
+    Constant, Name, UnaryOp, UnaryOpcode, is_truthy)
 from gerryopt.vector import Vec
 from gerrychain.updaters import Tally, cut_edges
 from gerrychain.grid import create_grid_graph
@@ -43,6 +43,8 @@ VEC_TYPE_UNIONS = [
 VEC_TYPES = SIMPLE_VEC_TYPES + VEC_TYPE_UNIONS
 
 PRIMITIVE_TYPES = SIMPLE_PRIMITIVE_TYPES + PRIMITIVE_TYPE_UNIONS
+
+TRUTHY_TYPES = PRIMITIVE_TYPES
 
 SIMPLE_TYPES = SIMPLE_PRIMITIVE_TYPES + SIMPLE_VEC_TYPES
 
@@ -604,6 +606,80 @@ def test_type_and_transform_expr_unary_op_not(operand_type, exp_type):
     uop_type, transformed_ast = type_and_transform_expr(uop_ast, ctx)
     assert uop_type == exp_type
     assert transformed_ast == UnaryOp(UnaryOpcode.NOT, Name('x'))
+
+
+@pytest.mark.parametrize('lhs_type', TRUTHY_TYPES)
+@pytest.mark.parametrize('rhs_type', TRUTHY_TYPES)
+@pytest.mark.parametrize('op', ['and', 'or'])
+def test_type_and_transform_expr_bool_op_primitive_pairs(
+        lhs_type, rhs_type, op):
+    if op == 'and':
+        ast_op = ast.And()
+        opcode = BoolOpcode.AND
+    elif op == 'or':
+        ast_op = ast.Or()
+        opcode = BoolOpcode.OR
+    bool_op_ast = ast.BoolOp(op=ast_op,
+                             values=[
+                                 ast.Name(id='x', ctx=ast.Load()),
+                                 ast.Name(id='y', ctx=ast.Load())
+                             ])
+    ctx = {'x': lhs_type, 'y': rhs_type}
+    bool_op_type, transformed_ast = type_and_transform_expr(bool_op_ast, ctx)
+    assert bool_op_type == bool
+    assert transformed_ast == BoolOp(opcode, (Name('x'), Name('y')))
+
+
+@pytest.mark.parametrize('lhs_type', TRUTHY_TYPES)
+@pytest.mark.parametrize('rhs_type', TRUTHY_TYPES)
+@pytest.mark.parametrize('op', ['and', 'or'])
+def test_type_and_transform_expr_bool_op_primitive_triples(
+        lhs_type, rhs_type, op):
+    if op == 'and':
+        ast_op = ast.And()
+        opcode = BoolOpcode.AND
+    elif op == 'or':
+        ast_op = ast.Or()
+        opcode = BoolOpcode.OR
+    bool_op_ast = ast.BoolOp(op=ast_op,
+                             values=[
+                                 ast.Name(id='x', ctx=ast.Load()),
+                                 ast.Name(id='y', ctx=ast.Load()),
+                                 ast.Name(id='z', ctx=ast.Load())
+                             ])
+    ctx = {'x': lhs_type, 'y': rhs_type, 'z': bool}
+    bool_op_type, transformed_ast = type_and_transform_expr(bool_op_ast, ctx)
+    assert bool_op_type == bool
+    assert transformed_ast == BoolOp(opcode, (Name('x'), Name('y'), Name('z')))
+
+
+@pytest.fixture
+def if_expr_ast():
+    return ast.IfExp(test=ast.Name(id='x', ctx=ast.Load()),
+                     body=ast.Name(id='y', ctx=ast.Load()),
+                     orelse=ast.Name(id='z', ctx=ast.Load()))
+
+
+def test_type_and_transform_expr_if_expr_same_type(if_expr_ast):
+    ctx = {'x': bool, 'y': int, 'z': int}
+    expected_ast = IfExpr(Name('x'), Name('y'), Name('z'))
+    uop_type, transformed_ast = type_and_transform_expr(if_expr_ast, ctx)
+    assert uop_type == int
+    assert transformed_ast == expected_ast
+
+
+def test_type_and_transform_expr_if_expr_different_types(if_expr_ast):
+    ctx = {'x': int, 'y': int, 'z': float}
+    expected_ast = IfExpr(Name('x'), Name('y'), Name('z'))
+    uop_type, transformed_ast = type_and_transform_expr(if_expr_ast, ctx)
+    assert uop_type == Union[int, float]
+    assert transformed_ast == expected_ast
+
+
+def test_type_and_transform_expr_if_expr_non_truthy_conditional(if_expr_ast):
+    ctx = {'x': Vec[bool], 'y': int, 'z': int}
+    with pytest.raises(CompileError):
+        type_and_transform_expr(if_expr_ast, ctx)
 
 
 @pytest.mark.parametrize('operand_type,exp_type', [

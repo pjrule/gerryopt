@@ -478,7 +478,7 @@ BoolOpcode = Enum('BoolOpcode', 'AND OR')
 @dataclass
 class BoolOp(Expr):
     op: BoolOpcode
-    values: List[Expr]
+    values: Iterable[Expr]
     OPS = {ast.And: BoolOpcode.AND, ast.Or: BoolOpcode.OR}
 
     @classmethod
