@@ -623,6 +623,15 @@ def test_type_and_transform_expr_unary_op_invert(operand_type, exp_type):
     assert transformed_ast == UnaryOp(UnaryOpcode.INVERT, Name('x'))
 
 
+def test_type_and_transform_expr_unary_op_invert_float():
+    uop_ast = ast.UnaryOp(op=ast.Invert(),
+                          operand=ast.Name(id='x', ctx=ast.Load()))
+    ctx = {'x': float}
+    with pytest.raises(CompileError):
+        # Invert not supported on floats
+        type_and_transform_expr(uop_ast, ctx)
+
+
 @pytest.mark.parametrize('t', PRIMITIVE_TYPES)
 def test_is_truthy_primitives(t):
     assert is_truthy(t)
@@ -735,4 +744,25 @@ def test_defined_type_product_simple_type_pairs(t):
     assert list(defined_type_product(t, t)) == [(t, t)]
 
 
-# TODO: more tests for defined_type_product and UnaryOp
+@pytest.mark.parametrize('t', TYPE_UNIONS)
+def test_defined_type_product_type_union_pairs(t):
+    assert set(defined_type_product(t, t)) == set(
+        product(get_args(t), get_args(t)))
+
+
+@pytest.mark.parametrize('t', TYPE_UNIONS)
+def test_defined_type_product_type_union_pairs(t):
+    assert set(defined_type_product(t, t)) == set(
+        product(get_args(t), get_args(t)))
+
+
+@pytest.mark.parametrize('t', TYPE_UNIONS)
+def test_defined_type_product_type_union_pairs_with_primitive(t):
+    assert set(defined_type_product(t, t, int)) == set(
+        (*ts, int) for ts in product(get_args(t), get_args(t)))
+
+
+@pytest.mark.parametrize('t', TYPE_UNIONS)
+def test_defined_type_product_type_union_pairs_with_undefined(t):
+    with pytest.raises(CompileError):
+        defined_type_product(t, t, Union[int, UndefinedVar])
