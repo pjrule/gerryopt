@@ -2,6 +2,7 @@
 from gerryopt.trace._expr import TracedExpr
 from gerryopt.trace.types import is_scalar, Scalar
 
+
 class Constant(TracedExpr):
     """A traced constant expression."""
     val: Scalar
@@ -11,3 +12,6 @@ class Constant(TracedExpr):
             raise TypeError('Constants must be of type int, float, or bool.')
         self.val = val
         self.dtype = type(val)
+
+    def __repr__(self):
+        return f'Constant({self.dtype.__name__}, {self.val})'

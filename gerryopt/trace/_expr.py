@@ -1,8 +1,7 @@
 """Tracing-based JIT compilation for GerryChain operations."""
 from abc import abstractmethod, ABC
-from typing import (Union, Any, Iterable, Optional, List, Tuple, get_args,
-                    get_origin)
-from gerryopt.trace.types import NdArrayT, Scalar, Val
+from typing import Any
+from gerryopt.trace.types import NdArrayT, Scalar
 
 
 def is_expr(expr: Any) -> bool:

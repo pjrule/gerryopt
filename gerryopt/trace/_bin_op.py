@@ -1,14 +1,15 @@
 """Tracing for binary operation expressions."""
-from enum import Enum
-from dataclasses import dataclass
-from abc import abstractmethod, ABC
-from typing import (Union, Any, Iterable, Optional, List, Tuple, get_args,
-                    get_origin)
 from itertools import product
+from typing import Union
 from gerryopt.trace._expr import TracedExpr
 from gerryopt.trace._constant import Constant
-from gerryopt.trace.opcodes import BinOpcode, BIN_OPCODE_TO_METHOD_NAME
-from gerryopt.trace.types import (Val, is_scalar, is_ndarray, size_intersection, type_union, type_product, make_ndarray)
+from gerryopt.trace.opcodes import (BinOpcode, BIN_OPCODE_TO_REPR,
+                                    BIN_OPCODE_TO_METHOD_NAME)
+from gerryopt.trace.types import (is_scalar, is_ndarray, scalar_type,
+                                  size_intersection, type_union, type_product,
+                                  make_ndarray, Scalar)
+
+Val = Union[TracedExpr, Scalar]
 
 
 class BinOp(TracedExpr):
@@ -48,7 +49,8 @@ class BinOp(TracedExpr):
                 #   * Subtraction of boolean ndarrays is not permitted.
                 #   * DIV: {float, int, bool} * {float, int, bool} -> float
                 #   * FLOOR_DIV, MOD, POW: {bool, int} * {bool, int} -> int
-                if (is_ndarray(lhs) or is_ndarray(rhs)) and op == BinOpcode.SUB:
+                if (is_ndarray(lhs)
+                        or is_ndarray(rhs)) and op == BinOpcode.SUB:
                     raise TypeError(
                         'Subtraction of boolean ndarrays is not permitted.')
 
@@ -67,11 +69,12 @@ class BinOp(TracedExpr):
                 if lhs_scalar == float or rhs_scalar == float:
                     raise TypeError(
                         'Bitwise operations are not supported on floats.')
-                if (lhs_scalar == int or rhs_scalar == int or op in (BinOpcode.L_SHIFT, BinOpcode.R_SHIFT)):
+                if (lhs_scalar == int or rhs_scalar == int
+                        or op in (BinOpcode.L_SHIFT, BinOpcode.R_SHIFT)):
                     op_scalar = int
                 else:
                     op_scalar = bool
-            elif op == BinOp.MAT_MUL:
+            elif op == BinOpcode.MAT_MUL:
                 # {int, bool, float} * float -> float
                 # float * {int, bool}  -> float
                 # {int, bool} * int -> int
@@ -79,7 +82,7 @@ class BinOp(TracedExpr):
                 # bool * bool -> bool
 
                 # check (approximate) compatibility.
-                size_intersection(lhs.dtype.size, rhs.dtype.size)  
+                size_intersection(lhs.dtype.size, rhs.dtype.size)
                 if lhs_scalar == float or rhs_scalar == float:
                     op_scalar = float
                 elif lhs_scalar == int or rhs_scalar == int:
@@ -87,7 +90,7 @@ class BinOp(TracedExpr):
                 else:
                     op_scalar = bool
                 type_lb = type_union(type_lb, op_scalar)
-                continue # normal broadcasting rules don't apply
+                continue  # normal broadcasting rules don't apply
             else:
                 raise ValueError(f'Unknown binary operation {op}.')
 
@@ -108,23 +111,32 @@ class BinOp(TracedExpr):
         self.dtype = type_lb
 
     def __repr__(self):
-        return f'BinOp[{self.op}, {self.left}, {self.right}]'
+        opcode_repr = BIN_OPCODE_TO_REPR[self.op]
+        return f'BinOp({opcode_repr}, {self.left}, {self.right})'
 
 
 # Dynamically inject binary operation tracing into generic expressions.
-for opcode, name in BIN_OPCODE_TO_METHOD_NAME.items():
-    setattr(TracedExpr, f'__{name}__', lambda self, other: BinOp(self, other, opcode))
-    setattr(TracedExpr, f'__r{name}__', lambda self, other: BinOp(other, self, opcode))
+for op, name in BIN_OPCODE_TO_METHOD_NAME.items():
+    # capturing op: see https://stackoverflow.com/a/2295372
+    setattr(TracedExpr,
+            f'__{name}__',
+            lambda self, other, _op=op: BinOp(self, other, _op))
+    setattr(TracedExpr,
+            f'__r{name}__',
+            lambda self, other, _op=op: BinOp(other, self, _op))
+
 
 def _expr_pow(self, other: Val, modulo=None) -> BinOp:
     if modulo is not None:
         raise NotImplementedError('Modulo not supported.')
     return BinOp(self, other, BinOpcode.POW)
 
+
 def _expr_rpow(self, other: Val, modulo=None) -> BinOp:
     if modulo is not None:
         raise NotImplementedError('Modulo not supported.')
-    return BinOp(other, self, BinOpcode.POW) 
+    return BinOp(other, self, BinOpcode.POW)
+
 
 TracedExpr.__pow__ = _expr_pow
 TracedExpr.__rpow__ = _expr_rpow

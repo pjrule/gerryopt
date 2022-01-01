@@ -2,12 +2,9 @@
 from typing import (Union, Any, Iterable, Optional, List, Tuple, get_args,
                     get_origin)
 from itertools import product
-from gerryopt.trace._expr import TracedExpr
-
 
 SCALAR_TYPES = [int, float, bool]
 Scalar = Union[int, float, bool]
-Val = Union[TracedExpr, Scalar]
 
 
 def type_product(*args: type) -> Iterable:

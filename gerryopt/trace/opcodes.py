@@ -2,7 +2,6 @@
 import operator
 from enum import Enum
 
-
 # Opcode definitions.
 BinOpcode = Enum(
     'BinOpcode',
@@ -11,7 +10,6 @@ BinOpcode = Enum(
 UnaryOpcode = Enum('UnaryOpcode', 'UADD USUB INVERT NOT')
 BoolOpcode = Enum('BoolOpcode', 'AND OR')
 CmpOpcode = Enum('CmpOpcode', 'EQ NOT_EQ LT LTE GT GTE')
-
 
 # Opcodes to operator functions.
 BIN_OPCODE_TO_FN = {
@@ -37,10 +35,9 @@ UNARY_OPCODE_TO_FN = {
 }
 OPCODE_TO_FN = {**BIN_OPCODE_TO_FN, **UNARY_OPCODE_TO_FN}
 
-
 # Opcodes to abbreviated "magic method" names, where applicable (e.g. __add__)
 BIN_OPCODE_TO_METHOD_NAME = {
-    BinOpcode.ADD: 'add',  
+    BinOpcode.ADD: 'add',
     BinOpcode.SUB: 'sub',
     BinOpcode.MUL: 'mul',
     BinOpcode.DIV: 'truediv',
