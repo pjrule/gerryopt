@@ -51,6 +51,12 @@ BIN_OPCODE_TO_METHOD_NAME = {
     BinOpcode.BIT_AND: 'and',
     BinOpcode.MAT_MUL: 'matmul'
 }
+UNARY_OPCODE_TO_METHOD_NAME = {
+    UnaryOpcode.UADD: 'pos',
+    UnaryOpcode.USUB: 'neg',
+    UnaryOpcode.INVERT: 'invert',
+    # `not` is intrinsic (needs AST rewrite)
+}
 OPCODE_TO_METHOD_NAME = BIN_OPCODE_TO_METHOD_NAME
 
 # Opcodes to human-readable operator representations.
@@ -73,6 +79,6 @@ UNARY_OPCODE_TO_REPR = {
     UnaryOpcode.UADD: '+',
     UnaryOpcode.USUB: '-',
     UnaryOpcode.INVERT: '~',
-    UnaryOpcode.NOT: 'not '
+    UnaryOpcode.NOT: 'not'
 }
 OPCODE_TO_REPR = {**BIN_OPCODE_TO_REPR, **UNARY_OPCODE_TO_REPR}

@@ -1,3 +1,4 @@
+"""Tests for traced binary operations."""
 import pytest
 import operator
 from typing import Callable, Generator, Tuple

@@ -13,6 +13,7 @@ Val = Union[TracedExpr, Scalar]
 
 
 class BinOp(TracedExpr):
+    """A binary operation expression."""
     left: TracedExpr
     right: TracedExpr
     op: BinOpcode
