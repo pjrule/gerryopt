@@ -1,7 +1,6 @@
 """Tests for traced binary operations."""
 import pytest
-import operator
-from typing import Callable, Generator, Tuple
+from typing import Generator, Tuple
 from gerryopt.trace import Constant, BinOp
 from gerryopt.trace.opcodes import (BinOpcode, BIN_OPCODE_TO_FN,
                                     BIN_OPCODE_TO_REPR)

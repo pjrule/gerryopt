@@ -2,12 +2,12 @@
 from itertools import product
 from typing import Union
 from gerryopt.trace._expr import TracedExpr
-from gerryopt.trace._constant import Constant
+from gerryopt.trace._constant import Constant, coerce_constants
 from gerryopt.trace.opcodes import (BinOpcode, BIN_OPCODE_TO_REPR,
                                     BIN_OPCODE_TO_METHOD_NAME)
-from gerryopt.trace.types import (is_scalar, is_ndarray, scalar_type,
-                                  size_intersection, type_union, type_product,
-                                  make_ndarray, Scalar)
+from gerryopt.trace.types import (binary_broadcast, is_scalar, is_ndarray,
+                                  scalar_type, size_intersection, type_union,
+                                  type_product, make_ndarray, Scalar)
 
 Val = Union[TracedExpr, Scalar]
 
@@ -28,11 +28,7 @@ class BinOp(TracedExpr):
     }
 
     def __init__(self, left: Val, right: Val, op: BinOpcode):
-        if is_scalar(type(left)):
-            left = Constant(left)
-        if is_scalar(type(right)):
-            right = Constant(right)
-
+        left, right = coerce_constants(left, right)
         self.left = left
         self.right = right
         self.op = op
@@ -96,19 +92,8 @@ class BinOp(TracedExpr):
                 raise ValueError(f'Unknown binary operation {op}.')
 
             # Apply broadcasting rules (non-matrix multiplication operations).
-            if is_ndarray(lhs) and is_ndarray(rhs):
-                # TODO: handle >1-dimensional arrays.
-                inter_size = size_intersection(lhs.dtype.size, rhs.dtype.size)
-                type_lb = type_union(type_lb,
-                                     make_ndarray(op_scalar, size=inter_size))
-            elif is_ndarray(lhs):
-                type_lb = type_union(
-                    type_lb, make_ndarray(op_scalar, type=lhs.dtype.size))
-            elif is_ndarray(rhs):
-                type_lb = type_union(
-                    type_lb, make_ndarray(op_scalar, type=rhs.dtype.size))
-            else:
-                type_lb = type_union(type_lb, op_scalar)
+            type_lb = type_union(type_lb,
+                                 binary_broadcast(op_scalar, lhs, rhs))
         self.dtype = type_lb
 
     def __repr__(self):

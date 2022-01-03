@@ -83,6 +83,13 @@ def is_ndarray(dtype: Any) -> bool:
     return issubclass(dtype, NdArrayT)
 
 
+def is_possibly_ndarray(t: type) -> bool:
+    """Determines if a type is an ndarray or union containing an ndarray."""
+    return (is_ndarray(get_origin(t))
+            or (get_origin(t) == Union
+                and any(is_ndarray(s) for s in get_args(t))))
+
+
 def scalar_type(dtype: Any) -> type:
     """Coerces ndarray types to scalar types (identity on scalar types).
 
@@ -94,3 +101,29 @@ def scalar_type(dtype: Any) -> type:
     if issubclass(dtype, NdArrayT):
         return dtype.scalar_type
     raise TypeError(f'Cannot coerce {dtype} to scalar type.')
+
+
+def binary_broadcast(el_type: type, lhs_type: type, rhs_type: type) -> type:
+    """Finds a broadcasted type for a (possibly vectorized) binary operation.
+    
+    A broadcasted binary operation is of the form <lhs> <op> <rhs> and yields
+    <result>. Binary operations may be arithmetic (these become `BinOp`
+    expressions when tracing) or comparative (these become `CmpOp` expressions
+    when tracing). If both the l.h.s. and the r.h.s. are scalar-valued, the result
+    has type `el_type`. Otherwise, the result is an `ndarray` with size bounds of
+    determined by the intersection (if possible) of `lhs_type` and `rhs_type`
+    and element type `el_type`.
+    
+    Raises:
+        TypeError: if a size intersection cannot be found between `lhs_type`
+        and `rhs_type`.
+    """
+    if is_ndarray(lhs_type) and is_ndarray(rhs_type):
+        # TODO: handle >1-dimensional arrays.
+        inter_size = size_intersection(lhs_type.size, rhs_type.size)
+        return make_ndarray(el_type, size=inter_size)
+    elif is_ndarray(lhs_type):
+        return make_ndarray(el_type, type=lhs_type.size)
+    elif is_ndarray(rhs_type):
+        return make_ndarray(el_type, type=rhs_type.size)
+    return el_type

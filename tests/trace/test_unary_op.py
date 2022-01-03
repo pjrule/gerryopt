@@ -1,7 +1,6 @@
 """Tests for traced unary operations."""
 import pytest
-import operator
-from typing import Callable, Generator, Tuple
+from typing import Generator, Tuple
 from gerryopt.trace import Constant, UnaryOp
 from gerryopt.trace.opcodes import (UnaryOpcode, UNARY_OPCODE_TO_FN,
                                     UNARY_OPCODE_TO_REPR)

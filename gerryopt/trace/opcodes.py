@@ -33,7 +33,16 @@ UNARY_OPCODE_TO_FN = {
     UnaryOpcode.INVERT: operator.inv,
     UnaryOpcode.NOT: operator.not_
 }
-OPCODE_TO_FN = {**BIN_OPCODE_TO_FN, **UNARY_OPCODE_TO_FN}
+CMP_OPCODE_TO_FN = {
+    CmpOpcode.EQ: operator.eq,
+    CmpOpcode.NOT_EQ: operator.ne,
+    CmpOpcode.LT: operator.lt,
+    CmpOpcode.LTE: operator.le,
+    CmpOpcode.GT: operator.gt,
+    CmpOpcode.GTE: operator.ge
+}
+
+OPCODE_TO_FN = {**BIN_OPCODE_TO_FN, **UNARY_OPCODE_TO_FN, **CMP_OPCODE_TO_FN}
 
 # Opcodes to abbreviated "magic method" names, where applicable (e.g. __add__)
 BIN_OPCODE_TO_METHOD_NAME = {
@@ -57,7 +66,19 @@ UNARY_OPCODE_TO_METHOD_NAME = {
     UnaryOpcode.INVERT: 'invert',
     # `not` is intrinsic (needs AST rewrite)
 }
-OPCODE_TO_METHOD_NAME = BIN_OPCODE_TO_METHOD_NAME
+CMP_OPCODE_TO_METHOD_NAME = {
+    CmpOpcode.EQ: 'eq',
+    CmpOpcode.NOT_EQ: 'ne',
+    CmpOpcode.LT: 'lt',
+    CmpOpcode.LTE: 'le',
+    CmpOpcode.GT: 'gt',
+    CmpOpcode.GTE: 'ge'
+}
+OPCODE_TO_METHOD_NAME = {
+    **BIN_OPCODE_TO_METHOD_NAME,
+    **UNARY_OPCODE_TO_METHOD_NAME,
+    **CMP_OPCODE_TO_METHOD_NAME
+}
 
 # Opcodes to human-readable operator representations.
 BIN_OPCODE_TO_REPR = {
@@ -81,4 +102,16 @@ UNARY_OPCODE_TO_REPR = {
     UnaryOpcode.INVERT: '~',
     UnaryOpcode.NOT: 'not'
 }
-OPCODE_TO_REPR = {**BIN_OPCODE_TO_REPR, **UNARY_OPCODE_TO_REPR}
+CMP_OPCODE_TO_REPR = {
+    CmpOpcode.EQ: '==',
+    CmpOpcode.NOT_EQ: '!=',
+    CmpOpcode.LT: '<',
+    CmpOpcode.LTE: '<=',
+    CmpOpcode.GT: '>',
+    CmpOpcode.GTE: '>='
+}
+OPCODE_TO_REPR = {
+    **BIN_OPCODE_TO_REPR,
+    **UNARY_OPCODE_TO_REPR,
+    **CMP_OPCODE_TO_REPR
+}
