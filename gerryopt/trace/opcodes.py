@@ -11,7 +11,11 @@ UnaryOpcode = Enum('UnaryOpcode', 'UADD USUB INVERT NOT')
 BoolOpcode = Enum('BoolOpcode', 'AND OR')
 CmpOpcode = Enum('CmpOpcode', 'EQ NOT_EQ LT LTE GT GTE')
 
-# Opcodes to operator functions.
+ARRAY_INIT_OPS = 'NDARRAY_ZEROS NDARRAY_ONES NDARRAY_ARANGE NDARRAY_LINSPACE'
+REDUCE_OPS = 'MIN MAX SUM MEAN MEDIAN MODE PERCENTILE'
+BasisOpcode = Enum('BasisOpcode', ' '.join([ARRAY_INIT_OPS, REDUCE_OPS]))
+
+# Opcodes to operator functions, where applicable.
 BIN_OPCODE_TO_FN = {
     BinOpcode.ADD: operator.add,
     BinOpcode.SUB: operator.sub,

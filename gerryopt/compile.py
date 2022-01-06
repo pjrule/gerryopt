@@ -7,8 +7,8 @@ from textwrap import dedent
 from dataclasses import dataclass, field, is_dataclass, asdict
 from enum import Enum
 from itertools import product
-from typing import (Callable, Iterable, Set, Dict, List, Union, Any, Optional,
-                    Tuple, get_args, get_origin)
+from typing import (Callable, Iterable, Sequence, Set, Dict, List, Union, Any,
+                    Optional, Tuple, get_args, get_origin)
 from gerrychain import Graph
 from gerrychain.updaters import Tally
 from gerryopt.vector import Vec
@@ -310,7 +310,14 @@ def scalar_type(t: type) -> type:
 
 def is_vec(t: type) -> bool:
     """Determines if a type is an instance of Vec[T]."""
-    return get_origin(t) is Vec
+    return get_origin(t) == Vec
+
+
+def is_possibly_vec(t: type) -> bool:
+    """Determines if a type is an instance of Vec[T] or Union[Vec[T], ...]."""
+    return (get_origin(t)
+            == Vec) or (get_origin(t) == Union
+                        and any(get_origin(s) == Vec for s in get_args(t)))
 
 
 class UndefinedVar:
@@ -554,7 +561,7 @@ class IfExpr(Expr):
     orelse: Expr
 
     @classmethod
-    def type_and_transform(cls, expr: ast.Expr,
+    def type_and_transform(cls, expr: ast.IfExp,
                            ctx: TypeContext) -> Tuple[type, 'IfExpr']:
         test_type, test_ast = type_and_transform_expr(expr.test, ctx)
         if_type, if_ast = type_and_transform_expr(expr.body, ctx)
@@ -569,6 +576,9 @@ CmpOpcode = Enum('CmpOpcode', 'EQ NOT_EQ LT LTE GT GTE')
 
 @dataclass
 class CmpOp(Expr):
+    ops: Sequence[CmpOpcode]
+    comps: Sequence[Expr]
+
     OPS = {
         ast.Eq: CmpOpcode.EQ,
         ast.NotEq: CmpOpcode.NOT_EQ,
@@ -577,6 +587,120 @@ class CmpOp(Expr):
         ast.Gt: CmpOpcode.GT,
         ast.GtE: CmpOpcode.GTE,
     }
+
+    @classmethod
+    def type_and_transform(cls, expr: ast.Compare,
+                           ctx: TypeContext) -> Tuple[type, 'CmpOp']:
+        raw_comps = [expr.left] + expr.comparators
+        typed_exprs = [type_and_transform_expr(e, ctx) for e in raw_comps]
+        types = [t for t, _ in typed_exprs]
+        exprs = [e for _, e in typed_exprs]
+
+        illegal_ops = set(type(op) for op in expr.ops) - set(CmpOp.OPS.keys())
+        if illegal_ops:
+            raise CompileError('Operations', illegal_ops, 'not supported.')
+
+        type_lb = None
+        if len(expr.ops) > 1 and any(is_possibly_vec(t) for t in types):
+            # We roughly mimic NumPy semantics.
+            raise CompileError('Cannot chain vector comparisons.')
+        if all(is_possibly_vec(t) for t in types):
+            type_lb = type_union(Vec[bool], type_lb)
+        if not all(is_vec(t) for t in types):
+            type_lb = type_union(bool, type_lb)
+        transformed_expr = cls([CmpOp.OPS[op] for op in expr.ops], exprs)
+        return type_lb, transformed_expr
+
+
+BinOpcode = Enum(
+    'BinOpcode',
+    'ADD SUB MULT DIV FLOOR_DIV MOD POW L_SHIFT R_SHIFT BIT_OR BIT_XOR BIT_AND MAT_MULT'
+)
+
+
+@dataclass
+class BinOp(Expr):
+    left: Expr
+    op: BinOpcode
+    right: Expr
+
+    OPS = {
+        ast.Add: BinOpcode.ADD,
+        ast.Sub: BinOpcode.SUB,
+        ast.Mult: BinOpcode.MULT,
+        ast.Div: BinOpcode.DIV,
+        ast.FloorDiv: BinOpcode.FLOOR_DIV,
+        ast.Mod: BinOpcode.MOD,
+        ast.Pow: BinOpcode.POW,
+        ast.LShift: BinOpcode.L_SHIFT,
+        ast.RShift: BinOpcode.R_SHIFT,
+        ast.BitOr: BinOpcode.BIT_OR,
+        ast.BitXor: BinOpcode.BIT_XOR,
+        ast.BitAnd: BinOpcode.BIT_AND,
+        ast.MatMult: BinOpcode.MAT_MULT
+    }
+    REAL_OPCODES = {
+        BinOpcode.ADD, BinOpcode.SUB, BinOpcode.MULT, BinOpcode.DIV,
+        BinOpcode.FLOOR_DIV, BinOpcode.MOD, BinOpcode.POW
+    }
+    BIT_OPCODES = {
+        BinOpcode.L_SHIFT, BinOpcode.R_SHIFT, BinOpcode.BIT_OR,
+        BinOpcode.BIT_XOR, BinOpcode.BIT_AND
+    }
+
+    @classmethod
+    def type_and_transform(cls, expr: ast.BinOp,
+                           ctx: TypeContext) -> Tuple[type, 'BinOp']:
+        opcode = BinOp.OPS[type(expr.op)]
+        lhs_type, lhs_ast = type_and_transform_expr(expr.left, ctx)
+        rhs_type, rhs_ast = type_and_transform_expr(expr.right, ctx)
+        type_lb = None
+        for (lhs, rhs) in defined_type_product(lhs_type, rhs_type):
+            if opcode in BinOp.REAL_OPCODES:
+                # In general, we have:
+                #   {float, int, bool} * float -> float
+                #   float * {float, int, bool} -> float
+                #   int * int -> int
+                #   int * bool -> int
+                #   bool * int -> int
+                #   bool * bool -> bool
+                # There are a few exceptions to mirror NumPy semantics.
+                #   * Subtraction of boolean vectors is not permitted.
+                #   * DIV: {float, int, bool} * {float, int, bool} -> float
+                #   * FLOOR_DIV, MOD, POW: {bool, int} * {bool, int} -> int
+                if (is_vec(lhs) or is_vec(rhs)) and opcode == BinOpcode.SUB:
+                    raise CompileError(
+                        'Subtraction of boolean vectors is not permitted.')
+                # Determine elementwise type.
+                lhs_scalar = scalar_type(lhs)
+                rhs_scalar = scalar_type(rhs)
+                op_scalar = None
+                if opcode == BinOpcode.DIV or lhs_scalar == float or rhs_scalar == float:
+                    op_scalar = float
+                elif (lhs_scalar == int or rhs_scalar == int
+                      or (opcode in (BoolOpcode.FLOOR_DIV, BoolOpcode.MOD,
+                                     BoolOpcode.POW) and
+                          (lhs_scalar == bool or rhs_scalar == bool))):
+                    op_scalar = int
+                else:
+                    op_scalar = bool
+                # Apply broadcasting rules.
+                if is_vec(lhs) or is_vec(rhs):
+                    type_lb = type_union(type_lb, Vec[op_scalar])
+                else:
+                    type_lb = type_union(type_lb, op_scalar)
+            elif opcode in BinOp.BIT_OPCODES:
+                # We have:
+                #  int * {int, bool} -> int
+                # {int, bool} * int -> int
+                # bool -> bool
+                # Bitwise operations are not supported on floats.
+
+                pass
+            elif opcode == BinOpcode.MAT_MULT:
+                pass
+            else:
+                raise CompileError(f'Unsupported binary operation {opcode}.')
 
 
 class ASTEncoder(json.JSONEncoder):

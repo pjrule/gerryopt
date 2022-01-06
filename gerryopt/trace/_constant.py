@@ -16,7 +16,14 @@ class Constant(TracedExpr):
     def __repr__(self):
         return f'Constant({self.dtype.__name__}, {self.val})'
 
+    def __hash__(self):
+        return hash(self.val)
+
 
 def coerce_constants(*args):
     """Coerces scalar values (bool, int, float) to `Constant` expressions."""
     return (Constant(val) if is_scalar(type(val)) else val for val in args)
+
+
+def is_constant(val) -> bool:
+    return isinstance(val, Constant)
